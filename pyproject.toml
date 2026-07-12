@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cjm-transcript-correction-tui"
+version = "0.0.1"
+description = "Transcript-correction TUI driver: keyboard-first terminal review surface (cursor-windowed segment walk, VAD-chunk audio auto-play, fidelity + boundary-shift corrections, agents-propose/humans-confirm triage) over cjm-transcript-correction-core's operation vocabulary. The first born-on-graph library of the self-hosting graph arc."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    'cjm-transcript-correction-core',
+    'textual',
+    'sounddevice',
+    'soundfile',
+]
+
+[project.scripts]
+cjm-transcript-correction-tui = "cjm_transcript_correction_tui.cli:main"
+
+[project.urls]
+Repository = "https://github.com/cj-mills/cjm-transcript-correction-tui"
+
+[tool.setuptools.packages.find]
+include = ["cjm_transcript_correction_tui*"]
