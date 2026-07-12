@@ -50,6 +50,7 @@ class ChunkPlayer:
         self,
         samplerate: int = 16000,  # Model-input WAV rate (the stream matches the file)
         blocksize: int = 128,     # Frames per callback block (the latency floor)
+        device: Optional[object] = None,  # Output device index/name (None = system default)
     ):
         self._buf: Optional[np.ndarray] = None   # Current chunk (float32 mono); None = silence
         self._pos = 0                            # Next frame within _buf
@@ -58,16 +59,16 @@ class ChunkPlayer:
         try:
             self._stream = sd.OutputStream(
                 samplerate=samplerate, channels=1, dtype="float32",
-                blocksize=blocksize, callback=self._callback)
+                blocksize=blocksize, callback=self._callback, device=device)
             self.stream_rate = samplerate
         except sd.PortAudioError:
             # The device dictates the stream rate, not the file: HDMI-class sinks
             # reject 16 kHz outright — open at the device's preferred rate and
             # resample each chunk on play() instead.
-            self.stream_rate = int(sd.query_devices(kind="output")["default_samplerate"])
+            self.stream_rate = int(sd.query_devices(device, kind="output")["default_samplerate"])
             self._stream = sd.OutputStream(
                 samplerate=self.stream_rate, channels=1, dtype="float32",
-                blocksize=blocksize, callback=self._callback)
+                blocksize=blocksize, callback=self._callback, device=device)
         self._stream.start()
 
     def _callback(self, out, frames, time_info, status) -> None:  # PortAudio pull (audio thread)

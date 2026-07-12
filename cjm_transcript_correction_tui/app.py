@@ -45,7 +45,8 @@ class CorrectionApp(App):
                  manifests_dir: str = ".cjm/manifests",   # Capability manifests directory
                  rendition: Optional[str] = None,         # Rendition selector (None = auto)
                  actor: str = "human",                    # Actor recorded on corrections
-                 autoplay: bool = True):                  # Auto-play the focused chunk
+                 autoplay: bool = True,                   # Auto-play the focused chunk
+                 audio_device: Optional[object] = None):  # Output device (None = system default)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition)
@@ -55,6 +56,7 @@ class CorrectionApp(App):
         self.cursor = 0
         self.actor = actor
         self.autoplay = autoplay
+        self.audio_device = audio_device
         self.session_id: Optional[str] = None
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._slots: List[Static] = []
@@ -68,7 +70,7 @@ class CorrectionApp(App):
 
     async def on_mount(self) -> None:
         self.view = await SpineView.open(self._graph_db_path, **self._open_kwargs)
-        self.player = ChunkPlayer()
+        self.player = ChunkPlayer(device=self.audio_device)
         sess = await start_session(self.view.queue, self.view.graph_id,
                                    [self.view.source_id])
         self.session_id = sess.id

@@ -23,14 +23,21 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                    help="Actor recorded on corrections + review markers")
     p.add_argument("--no-autoplay", action="store_true",
                    help="Do not auto-play the focused segment's VAD chunk")
+    p.add_argument("--audio-device", default=None,
+                   help="Output device index or name substring (default: the system "
+                        "default sink — pipewire/pulse routing when available)")
     return p
 
 
 def main() -> int:  # Console-script entry point
     """Parse args, run the correction loop (the app owns the event loop + teardown)."""
     args = build_parser().parse_args()
+    device = args.audio_device
+    if device is not None and device.isdigit():
+        device = int(device)
     app = CorrectionApp(args.graph_db_path, source=args.source,
                         manifests_dir=args.manifests_dir, rendition=args.rendition,
-                        actor=args.actor, autoplay=not args.no_autoplay)
+                        actor=args.actor, autoplay=not args.no_autoplay,
+                        audio_device=device)
     app.run()
     return 0
