@@ -1,7 +1,7 @@
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from cjm_context_graph_layer.grammar import OverlayRelations, SpineRelations
 from cjm_context_graph_layer.ops import graph_task
