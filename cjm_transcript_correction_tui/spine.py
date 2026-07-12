@@ -45,7 +45,7 @@ class SpineView:
     def __init__(self, manager: CapabilityManager, queue: JobQueue, graph_id: str,
                  source_id: str, source_title: str):
         self._manager = manager
-        self._queue = queue
+        self.queue = queue
         self.graph_id = graph_id
         self.source_id = source_id
         self.source_title = source_title
@@ -88,24 +88,24 @@ class SpineView:
 
     async def _load(self, rendition: Optional[str]) -> None:
         """Load spine + corrections + the audio join (one Source, one rendition chain)."""
-        segments = await load_source_segments(self._queue, self.graph_id, self.source_id,
+        segments = await load_source_segments(self.queue, self.graph_id, self.source_id,
                                               rendition_selector=rendition)
         corrections, superseded = await load_source_corrections(
-            self._queue, self.graph_id, self.source_id)
+            self.queue, self.graph_id, self.source_id)
         self.segments = project_effective_spine(
             segments, active_corrections(corrections, superseded))
         rend_ids = set(await resolve_source_renditions(
-            self._queue, self.graph_id, self.source_id, rendition))
+            self.queue, self.graph_id, self.source_id, rendition))
         aq = NodeQuery(label=TranscriptGraphLabels.AUDIO_SEGMENT,
                        related=RelationPredicate(SpineRelations.PART_OF, node_id=self.source_id),
                        order_by=OrderBy(prop="start"), project=["start", "end"])
-        ares = await graph_task(self._queue, self.graph_id, "query_nodes", query=aq.to_dict())
+        ares = await graph_task(self.queue, self.graph_id, "query_nodes", query=aq.to_dict())
         asegs = [(r["id"], float(r.get("start") or 0.0)) for r in (ares.rows or [])]
         rq = NodeQuery(label=TranscriptGraphLabels.AUDIO_RENDITION,
                        related=RelationPredicate(OverlayRelations.DERIVED_FROM,
                                                  node_ids=[a[0] for a in asegs]),
                        project=["model_input_path", "audio_segment_id"])
-        rres = await graph_task(self._queue, self.graph_id, "query_nodes", query=rq.to_dict())
+        rres = await graph_task(self.queue, self.graph_id, "query_nodes", query=rq.to_dict())
         wav_by_aseg: Dict[str, str] = {
             str(r.get("audio_segment_id")): str(r.get("model_input_path") or "")
             for r in (rres.rows or []) if r["id"] in rend_ids}
@@ -143,7 +143,7 @@ class SpineView:
 
     async def close(self) -> None:
         """Tear down the queue + capability stack (app exit)."""
-        await self._queue.stop()
+        await self.queue.stop()
         try:
             self._manager.unload_capability(self.graph_id)
         except Exception:
