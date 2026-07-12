@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     'cjm-transcript-correction-core',
     'textual',
+    'numpy',
     'sounddevice',
     'soundfile',
 ]
