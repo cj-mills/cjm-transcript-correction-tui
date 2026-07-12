@@ -49,7 +49,8 @@ class SpineView:
         self.graph_id = graph_id
         self.source_id = source_id
         self.source_title = source_title
-        self.segments: List[SpineSegment] = []       # Effective spine, index order
+        self.segments: List[SpineSegment] = []       # Full-skeleton effective spine (text edits applied, prunes marked)
+        self.pruned_ids: set = set()                 # Segment ids a prune correction targets (card marks)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
 
@@ -92,8 +93,19 @@ class SpineView:
                                               rendition_selector=rendition)
         corrections, superseded = await load_source_corrections(
             self.queue, self.graph_id, self.source_id)
-        self.segments = project_effective_spine(
-            segments, active_corrections(corrections, superseded))
+        active = active_corrections(corrections, superseded)
+        # The correction surface walks the FULL VAD skeleton (the 1:1 invariant):
+        # prune corrections are NOT applied to this view — an "empty" chunk may hold
+        # speech that FA starved (the falsified D14 premise), and an empty chunk is
+        # exactly where a boundary-shift pulls mis-assigned text back. Pruned ids
+        # surface as card marks instead of disappearing from the walk.
+        self.pruned_ids = {
+            sid for c in active
+            if c.get("correction_type") == "grouping"
+            and (c.get("payload") or {}).get("operation") == "prune_empty"
+            for sid in (c.get("payload") or {}).get("pruned_segment_ids") or []}
+        text_only = [c for c in active if c.get("correction_type") != "grouping"]
+        self.segments = project_effective_spine(segments, text_only)
         rend_ids = set(await resolve_source_renditions(
             self.queue, self.graph_id, self.source_id, rendition))
         aq = NodeQuery(label=TranscriptGraphLabels.AUDIO_SEGMENT,
@@ -125,6 +137,15 @@ class SpineView:
         half = count // 2
         start = max(0, min(max(0, cursor - half), len(self.segments) - count))
         return self.segments[start:start + count]
+
+    def aseg_index(self, index: int) -> Optional[int]:
+        """Which coarse AudioSegment (by position) a segment sits in — seam rendering."""
+        if not (0 <= index < len(self.segments)) or not self._aseg_starts:
+            return None
+        seg = self.segments[index]
+        if seg.start_time is None:
+            return None
+        return max(0, bisect_right(self._aseg_starts, float(seg.start_time)) - 1)
 
     def chunk(self, index: int) -> Optional[ChunkRef]:
         """The Segment's VAD-chunk audio ref (model-input WAV + chunk-local span), or None."""
