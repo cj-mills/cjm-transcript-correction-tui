@@ -126,10 +126,15 @@ class CorrectionApp(App):
         gut_w = self._gutter_w
         lane_w = max(10, width - gut_w)
         mark = {"reviewed": "✓", "corrected": "✎"}.get(self._marks.get(pos, ""), "·")
-        g1 = Text(f"#{seg.index} {mark}", style="dim")
+        # Gutter styling must ride SPANS, not the Text base style: lane text is
+        # appended onto these same row objects, and a base style would bleed
+        # into it (the round-2 drive regression — first two lane lines dimmed).
+        g1 = Text()
+        g1.append(f"#{seg.index} {mark}", style="dim")
         if seg.id in view.pruned_ids:
             g1.append(" ✂", style="red")
-        g2 = Text(f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
+        g2 = Text()
+        g2.append(f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
                   if seg.start_time is not None else "(no audio)", style="dim")
         body = Text(seg.text) if seg.text else Text("(empty)", style="dim")
         if abs(pos - self.cursor) > 1 and seg.text:
