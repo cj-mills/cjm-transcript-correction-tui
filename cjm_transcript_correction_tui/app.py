@@ -217,7 +217,7 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · [/] speed · e edit · y copy"
+            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · \\[/] speed · e edit · y copy"
             f" · space reviewed · q quit")
 
     def _play_cursor(self) -> None:
