@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -215,12 +217,32 @@ class CorrectionApp(App):
         self._play_cursor()
 
     def action_yank(self) -> None:
-        """Copy the focused segment's effective text to the system clipboard
-        (OSC 52) — sharing a segment must not require a screenshot or re-typing."""
+        """Copy the focused segment's effective text to the system clipboard —
+        sharing a segment must not require a screenshot or re-typing.
+
+        A clipboard TOOL (wl-copy/xclip/xsel) is the primary path: OSC 52 is
+        fire-and-forget and VTE terminals commonly reject it (drive round 5),
+        so it stays only as the fallback for tool-less hosts."""
         seg = self.view.segments[self.cursor]
-        self.copy_to_clipboard(seg.text)
+        via = self._copy_system(seg.text)
+        if via is None:
+            self.copy_to_clipboard(seg.text)   # OSC 52 — may be ignored by the terminal
+            via = "osc52, terminal-dependent"
         self.query_one("#status", Static).update(
-            f"copied segment #{seg.index} text ({len(seg.text)} chars)")
+            f"copied segment #{seg.index} text ({len(seg.text)} chars, {via})")
+
+    def _copy_system(self, text: str) -> Optional[str]:
+        """Pipe text to the first available system clipboard tool; None = no tool took it."""
+        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"]):
+            if shutil.which(cmd[0]) is None:
+                continue
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, timeout=2)
+                return cmd[0]
+            except (OSError, subprocess.SubprocessError):
+                continue
+        return None
 
     def action_edit(self) -> None:
         editor = self.query_one("#editor", Input)
