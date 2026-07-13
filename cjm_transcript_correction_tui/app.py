@@ -1,14 +1,14 @@
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_prune_amendment, commit_text_correction,
                                                   record_review_markers, start_session)
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
 from textual.widgets import Input, Static
 
 from .audio import ChunkPlayer, load_chunk
@@ -21,8 +21,11 @@ class CorrectionApp(App):
     graph through correction-core's operation vocabulary.
 
     Interaction contract (DEC 54640079 + the walkthrough capture): the surface is a
-    fixed-slot window over the cursor-parameterized effective spine — scrolling
-    (keys AND wheel) moves the CURSOR, slots re-bind around it, nothing moves
+    CENTER-PINNED window over the cursor-parameterized effective spine (drive
+    round 4 ratification): the focused card's text line sits at the exact screen
+    center, neighbor cards stack outward and absorb the varying text heights, so
+    the eyes never leave center — segments flow past the pin. Scrolling (keys AND
+    wheel) moves the CURSOR, the paint recomposes around it, nothing moves
     unbidden, content never overlaps. Focusing a segment auto-plays its VAD chunk
     from the model-input WAV (immediate-play; churn accepted per the spike). An
     edit commits a `text_content` Correction (+ its REVIEWED marker) and updates
@@ -31,6 +34,10 @@ class CorrectionApp(App):
     Textual's event loop."""
 
     AUTO_FOCUS = None  # the hidden editor Input must not swallow the walk keys at mount
+
+    CSS = """
+    #cards { height: 1fr; overflow: hidden hidden; }
+    """
 
     BINDINGS = [
         Binding("j", "next", "next"),
@@ -76,10 +83,9 @@ class CorrectionApp(App):
         self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
         self.resume = resume
         self._state_saved = 0.0            # last sidecar bookmark write (monotonic; 1s throttle)
-        self._slots: List[Static] = []
 
     def compose(self) -> ComposeResult:
-        yield Vertical(id="cards")
+        yield Static("", id="cards")
         yield Static("loading spine…", id="status")
         editor = Input(id="editor")
         editor.display = False
@@ -95,54 +101,77 @@ class CorrectionApp(App):
             saved = load_tui_state(self._graph_db_path).get(self.view.source_id)
             if saved and self.view.size:
                 self.cursor = max(0, min(self.view.size - 1, int(saved.get("cursor", 0))))
-        await self._build_slots()
         self._render()
         if self.autoplay:
             self._play_cursor()
 
-    async def on_resize(self, event) -> None:
+    def on_resize(self, event) -> None:
         if self.view is not None:
-            await self._build_slots()
             self._render()
 
-    async def _build_slots(self) -> None:
-        """Fixed slot count sized to the terminal (the FastHTML-era slot model):
-        each card budget ~4 lines + chrome; slots re-bind, they are never scrolled."""
-        cards = self.query_one("#cards", Vertical)
-        await cards.remove_children()
-        n = max(3, (self.size.height - 4) // 4)
-        self._slots = [Static("", classes="card") for _ in range(n)]
-        for s in self._slots:
-            await cards.mount(s)
+    def _card_lines(self, pos: int, width: int) -> Tuple[List[Text], int]:
+        """One segment card as styled screen lines + the offset of its first body line.
+
+        Visual hierarchy (flow-state principle): metadata RECEDES (dim); segment
+        text carries full brightness at cursor±1 (boundary work reads both sides)
+        and dims in the far field; the focused card is a full-width reverse band."""
+        view = self.view
+        seg = view.segments[pos]
+        mark = {"reviewed": "✓", "corrected": "✎"}.get(self._marks.get(pos, ""), "·")
+        t = (f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
+             if seg.start_time is not None else "(no audio)")
+        head = Text(f"#{seg.index}  {t}  {mark}",
+                    style="" if pos == self.cursor else "dim")
+        if seg.id in view.pruned_ids:
+            head.append("  ✂", style="red")
+        lines: List[Text] = []
+        a = view.aseg_index(pos)
+        if a is not None and (pos == 0 or view.aseg_index(pos - 1) != a):
+            lines.append(Text(f"━━━ audio segment {a} ━━━", style="yellow"))
+        lines.append(head)
+        body_offset = len(lines)
+        body = Text(seg.text) if seg.text else Text("(empty)", style="dim")
+        if abs(pos - self.cursor) > 1 and seg.text:
+            body.stylize("dim")
+        lines.extend(body.wrap(self.console, width))
+        if pos == self.cursor:
+            for ln in lines:
+                ln.pad_right(max(0, width - ln.cell_len))
+                ln.stylize("reverse")
+        return lines, body_offset
 
     def _render(self) -> None:
-        view, n = self.view, len(self._slots)
-        window = view.window(self.cursor, n)
-        half = n // 2
-        start = max(0, min(max(0, self.cursor - half), max(0, view.size - n)))
-        for slot, seg in zip(self._slots, window + [None] * (n - len(window))):
-            if seg is None:
-                slot.update("")
-                continue
-            pos = start + window.index(seg)
-            mark = {"reviewed": "✓", "corrected": "✎"}.get(self._marks.get(pos, ""), "·")
-            t = (f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
-                 if seg.start_time is not None else "(no audio)")
-            # Visual hierarchy (flow-state principle): metadata RECEDES (dim),
-            # segment text carries full brightness; state rides color glyphs.
-            head = f"#{seg.index}  {t}  {mark}"
-            if pos != self.cursor:
-                head = f"[dim]{head}[/dim]"
-            if seg.id in view.pruned_ids:
-                head += "  [red]✂[/red]"
-            a = view.aseg_index(pos)
-            if a is not None and (pos == 0 or view.aseg_index(pos - 1) != a):
-                head = f"[yellow]━━━ audio segment {a} ━━━[/yellow]\n{head}"
-            body = seg.text or "[dim](empty)[/dim]"
-            if abs(pos - self.cursor) > 1:
-                body = f"[dim]{body}[/dim]"   # quiet the far field; cursor±1 stays bright (boundary work reads both sides)
-            text = f"{head}\n{body}"
-            slot.update(f"[reverse]{text}[/reverse]" if pos == self.cursor else text)
+        """Center-pinned paint (drive round 4): the focused card's FIRST TEXT LINE
+        is pinned to the vertical center of the card area; neighbor cards stack
+        outward from it (one blank separator row) and absorb the height variance,
+        clipping at the screen edges. The pin never moves — the spine flows past it."""
+        view = self.view
+        width = max(20, self.size.width)
+        height = max(3, self.size.height - 1)   # the status line keeps the last row
+        rows: List[Optional[Text]] = [None] * height
+
+        def place(lines: List[Text], top: int) -> None:
+            for i, ln in enumerate(lines):
+                if 0 <= top + i < height:
+                    rows[top + i] = ln
+
+        f_lines, f_off = self._card_lines(self.cursor, width)
+        top_f = height // 2 - f_off             # body line 0 lands dead center
+        place(f_lines, top_f)
+        pos, bottom = self.cursor - 1, top_f - 2
+        while pos >= 0 and bottom >= 0:
+            lines, _ = self._card_lines(pos, width)
+            place(lines, bottom - len(lines) + 1)
+            bottom -= len(lines) + 1
+            pos -= 1
+        pos, top = self.cursor + 1, top_f + len(f_lines) + 1
+        while pos < view.size and top < height:
+            lines, _ = self._card_lines(pos, width)
+            place(lines, top)
+            top += len(lines) + 1
+            pos += 1
+        self.query_one("#cards", Static).update(
+            Text("\n").join(ln if ln is not None else Text("") for ln in rows))
         done = sum(1 for v in self._marks.values() if v)
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
