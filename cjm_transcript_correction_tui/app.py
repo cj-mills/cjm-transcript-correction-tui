@@ -1,14 +1,15 @@
 from typing import Dict, List, Optional
 
-from cjm_transcript_correction_core.graph import (commit_text_correction, record_review_markers,
-                                                  start_session)
+from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
+                                                  commit_prune_amendment, commit_text_correction,
+                                                  record_review_markers, start_session)
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Input, Static
 
 from .audio import ChunkPlayer, load_chunk
-from .spine import SpineView
+from .spine import plan_boundary_shift, SpineView
 
 
 class CorrectionApp(App):
@@ -35,6 +36,8 @@ class CorrectionApp(App):
         Binding("up", "prev", "prev", show=False),
         Binding("r", "replay", "replay"),
         Binding("e", "edit", "edit text"),
+        Binding("right_square_bracket", "shift_push", "] push word", key_display="]"),
+        Binding("left_square_bracket", "shift_pull", "[ pull word", key_display="["),
         Binding("space", "reviewed", "mark reviewed"),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
@@ -120,7 +123,7 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k walk · r replay · e edit · space reviewed · q quit")
+            f"  ·  j/k walk · r replay · e edit · [ ] shift word · space reviewed · q quit")
 
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
@@ -183,6 +186,46 @@ class CorrectionApp(App):
                                     self.session_id, [(seg.id, "reviewed")])
         self._marks.setdefault(self.cursor, "reviewed")
         self._move(1)
+
+    async def _shift_boundary(self, direction: str) -> None:
+        """One [ / ] press: move ONE word across the boundary AFTER the cursor.
+
+        Commits a boundary_shift Correction (word-level payload, layer 0.0.8
+        semantics); when the RECEIVING segment is prune-covered, also commits
+        the unprune amendment (the falsified-D14 rescue — without it the
+        projection drops the moved text with the pruned position)."""
+        view, i = self.view, self.cursor
+        status = self.query_one("#status", Static)
+        if i + 1 >= view.size:
+            status.update("boundary shift: no segment after the cursor")
+            return
+        left, right = view.segments[i], view.segments[i + 1]
+        plan = plan_boundary_shift(left.text, right.text, direction)
+        if plan is None:
+            status.update(f"boundary shift: nothing to {direction}")
+            return
+        moved, new_left, new_right = plan
+        await commit_boundary_shift_correction(
+            view.queue, view.graph_id, view.source_id, left.id, right.id,
+            moved, direction, self.session_id, actor=self.actor)
+        receiver = right if direction == "push" else left
+        if receiver.id in view.pruned_ids:
+            prior = view.prune_correction_for(receiver.id)
+            if prior is not None:
+                amended = await commit_prune_amendment(
+                    view.queue, view.graph_id, prior, [receiver.id],
+                    self.session_id, actor=self.actor)
+                view.unprune_local(prior["id"], amended)
+        left.text, right.text = new_left, new_right   # local echo (same math as the layer)
+        self._marks[i] = "corrected"
+        self._marks[i + 1] = "corrected"
+        self._render()
+
+    async def action_shift_push(self) -> None:
+        await self._shift_boundary("push")
+
+    async def action_shift_pull(self) -> None:
+        await self._shift_boundary("pull")
 
     def action_cancel(self) -> None:
         editor = self.query_one("#editor", Input)

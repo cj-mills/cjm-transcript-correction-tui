@@ -1,7 +1,7 @@
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.grammar import OverlayRelations, SpineRelations
 from cjm_context_graph_layer.ops import graph_task
@@ -51,6 +51,7 @@ class SpineView:
         self.source_title = source_title
         self.segments: List[SpineSegment] = []       # Full-skeleton effective spine (text edits applied, prunes marked)
         self.pruned_ids: set = set()                 # Segment ids a prune correction targets (card marks)
+        self._prune_corrections: List[dict] = []     # Active prune Corrections (unprune anchors)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
 
@@ -99,13 +100,19 @@ class SpineView:
         # speech that FA starved (the falsified D14 premise), and an empty chunk is
         # exactly where a boundary-shift pulls mis-assigned text back. Pruned ids
         # surface as card marks instead of disappearing from the walk.
-        self.pruned_ids = {
-            sid for c in active
+        self._prune_corrections = [
+            c for c in active
             if c.get("correction_type") == "grouping"
-            and (c.get("payload") or {}).get("operation") == "prune_empty"
+            and (c.get("payload") or {}).get("operation") == "prune_empty"]
+        self.pruned_ids = {
+            sid for c in self._prune_corrections
             for sid in (c.get("payload") or {}).get("pruned_segment_ids") or []}
-        text_only = [c for c in active if c.get("correction_type") != "grouping"]
-        self.segments = project_effective_spine(segments, text_only)
+        # Prunes are the ONLY corrections withheld from this view (their
+        # positions stay walkable, marked); boundary shifts and text edits
+        # APPLY, review verdicts map to no edit (58b2e0a0 residual fix).
+        prune_ids = {c.get("id") for c in self._prune_corrections}
+        projected = [c for c in active if c.get("id") not in prune_ids]
+        self.segments = project_effective_spine(segments, projected)
         rend_ids = set(await resolve_source_renditions(
             self.queue, self.graph_id, self.source_id, rendition))
         aq = NodeQuery(label=TranscriptGraphLabels.AUDIO_SEGMENT,
@@ -162,6 +169,21 @@ class SpineView:
                         float(seg.start_time) - stub.start_s,
                         float(seg.end_time) - stub.start_s)
 
+    def prune_correction_for(self, segment_id: str) -> Optional[dict]:
+        """The active prune Correction covering a segment (the unprune anchor), or None."""
+        for c in self._prune_corrections:
+            if segment_id in ((c.get("payload") or {}).get("pruned_segment_ids") or []):
+                return c
+        return None
+
+    def unprune_local(self, prior_id: str, amended: dict) -> None:
+        """Local echo of a committed prune amendment (amended supersedes prior_id)."""
+        self._prune_corrections = [amended if c.get("id") == prior_id else c
+                                   for c in self._prune_corrections]
+        self.pruned_ids = {
+            sid for c in self._prune_corrections
+            for sid in (c.get("payload") or {}).get("pruned_segment_ids") or []}
+
     async def close(self) -> None:
         """Tear down the queue + capability stack (app exit)."""
         await self.queue.stop()
@@ -169,3 +191,36 @@ class SpineView:
             self._manager.unload_capability(self.graph_id)
         except Exception:
             pass
+
+
+def plan_boundary_shift(
+    left_text: str,   # The cursor segment's current effective text
+    right_text: str,  # The next segment's current effective text
+    direction: str,   # "push" (last word of left -> right) | "pull" (first word of right -> left)
+) -> Optional[Tuple[str, str, str]]:  # (moved word, new left text, new right text); None = nothing to move
+    """Plan a ONE-WORD boundary shift (the [ / ] gesture unit).
+
+    Mirrors the layer's junction-normalizing semantics (DEC f83c6931) for the
+    local echo: single-space joins, vacated boundary whitespace collapses.
+    Repeat presses chain one-word corrections; the projection applies them in
+    created_at order over the evolving text, so the chain composes exactly.
+    """
+    if direction == "push":
+        words = left_text.split()
+        if not words:
+            return None
+        moved = words[-1]
+        base = left_text.rstrip()
+        new_left = base[: len(base) - len(moved)].rstrip()
+        rtext = right_text.lstrip()
+        new_right = f"{moved} {rtext}" if rtext else moved
+    else:
+        words = right_text.split()
+        if not words:
+            return None
+        moved = words[0]
+        base = right_text.lstrip()
+        new_right = base[len(moved):].lstrip()
+        ltext = left_text.rstrip()
+        new_left = f"{ltext} {moved}" if ltext else moved
+    return moved, new_left, new_right
