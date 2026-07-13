@@ -58,7 +58,7 @@ class CorrectionApp(App):
                  autoplay: bool = True,                   # Auto-play the focused chunk
                  audio_device: Optional[object] = None,   # Output device (None = system default)
                  resume: bool = True,                     # Reopen at the source's last-focused segment
-                 shift_floor_s: float = 0.08):            # Min seconds between held-key boundary shifts
+                 shift_floor_s: float = 0.001):           # Min seconds between held-key boundary shifts (commit latency is the real governor)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition)
@@ -126,15 +126,21 @@ class CorrectionApp(App):
                 continue
             pos = start + window.index(seg)
             mark = {"reviewed": "✓", "corrected": "✎"}.get(self._marks.get(pos, ""), "·")
-            if seg.id in view.pruned_ids:
-                mark += "  [red]✂ pruned-empty[/red]"
             t = (f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
                  if seg.start_time is not None else "(no audio)")
-            head = f"[bold]#{seg.index}[/bold]  {t}  {mark}"
+            # Visual hierarchy (flow-state principle): metadata RECEDES (dim),
+            # segment text carries full brightness; state rides color glyphs.
+            head = f"#{seg.index}  {t}  {mark}"
+            if pos != self.cursor:
+                head = f"[dim]{head}[/dim]"
+            if seg.id in view.pruned_ids:
+                head += "  [red]✂[/red]"
             a = view.aseg_index(pos)
             if a is not None and (pos == 0 or view.aseg_index(pos - 1) != a):
                 head = f"[yellow]━━━ audio segment {a} ━━━[/yellow]\n{head}"
             body = seg.text or "[dim](empty)[/dim]"
+            if abs(pos - self.cursor) > 1:
+                body = f"[dim]{body}[/dim]"   # quiet the far field; cursor±1 stays bright (boundary work reads both sides)
             text = f"{head}\n{body}"
             slot.update(f"[reverse]{text}[/reverse]" if pos == self.cursor else text)
         done = sum(1 for v in self._marks.values() if v)

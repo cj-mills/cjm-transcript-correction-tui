@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "default sink — pipewire/pulse routing when available)")
     p.add_argument("--no-resume", action="store_true",
                    help="Start at segment 0 instead of the source's last-focused segment")
-    p.add_argument("--shift-floor-ms", type=int, default=80,
+    p.add_argument("--shift-floor-ms", type=int, default=1,
                    help="Minimum milliseconds between held-key boundary shifts "
                         "(measure your key rates with tests_manual/keyrate_probe.py)")
     return p
