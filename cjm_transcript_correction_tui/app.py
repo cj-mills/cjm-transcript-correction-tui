@@ -37,7 +37,7 @@ class CorrectionApp(App):
 
     AUTO_FOCUS = None  # the hidden editor Input must not swallow the walk keys at mount
 
-    SPEEDS = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)  # the [ ] playback-rate ladder
+    SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)  # the [ ] playback-rate ladder (0.5/3.0 = the comprehension bounds, drive-round-7 verdict)
 
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
