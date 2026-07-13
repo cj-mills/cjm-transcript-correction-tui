@@ -200,6 +200,18 @@ class CorrectionApp(App):
                 old_text=seg.text, actor=self.actor)
             seg.text = new_text          # local echo of the new effective text
             self._marks[self.cursor] = "corrected"
+        # A text-bearing PRUNED position must leave the prune set (the same
+        # rescue as boundary shifts): the prune otherwise drops the position —
+        # WITH its restored text — from the downstream effective view. Fires
+        # on re-submit too (recovery path for edits made before this guard).
+        if new_text.strip() and seg.id in self.view.pruned_ids:
+            prior = self.view.prune_correction_for(seg.id)
+            if prior is not None:
+                amended = await commit_prune_amendment(
+                    self.view.queue, self.view.graph_id, prior, [seg.id],
+                    self.session_id, actor=self.actor)
+                self.view.unprune_local(prior["id"], amended)
+                self._marks[self.cursor] = "corrected"
         self._close_editor()
         self._render()
 
@@ -239,6 +251,9 @@ class CorrectionApp(App):
         status = self.query_one("#status", Static)
         if i + 1 >= view.size:
             status.update("boundary shift: no segment after the cursor")
+            return
+        if view.aseg_index(i) != view.aseg_index(i + 1):
+            status.update("boundary shift: ✋ audio-segment seam — text stays within its audio segment")
             return
         left, right = view.segments[i], view.segments[i + 1]
         plan = plan_boundary_shift(left.text, right.text, direction)
