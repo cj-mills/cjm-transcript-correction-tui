@@ -115,33 +115,52 @@ class CorrectionApp(App):
     def _card_lines(self, pos: int, width: int) -> Tuple[List[Text], int]:
         """One segment card as styled screen lines + the offset of its first body line.
 
-        Visual hierarchy (flow-state principle): metadata RECEDES (dim); segment
-        text carries full brightness at cursor±1 (boundary work reads both sides)
-        and dims in the far field; the focused card is a full-width reverse band."""
+        FIXED GUTTER, ONE TEXT LANE (presentation agenda item 1): index/time/marks
+        live in a fixed-width left column and ALWAYS recede (dim — the eye must be
+        unable to accidentally read a timestamp); segment text gets its own
+        consistently-indented lane, so walking scans a single vertical column of
+        pure prose. Focus emphasis carries over: cursor±1 lane text bright, far
+        field dim, the focused card a full-width reverse band."""
         view = self.view
         seg = view.segments[pos]
+        gut_w = self._gutter_w
+        lane_w = max(10, width - gut_w)
         mark = {"reviewed": "✓", "corrected": "✎"}.get(self._marks.get(pos, ""), "·")
-        t = (f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
-             if seg.start_time is not None else "(no audio)")
-        head = Text(f"#{seg.index}  {t}  {mark}",
-                    style="" if pos == self.cursor else "dim")
+        g1 = Text(f"#{seg.index} {mark}", style="dim")
         if seg.id in view.pruned_ids:
-            head.append("  ✂", style="red")
+            g1.append(" ✂", style="red")
+        g2 = Text(f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
+                  if seg.start_time is not None else "(no audio)", style="dim")
+        body = Text(seg.text) if seg.text else Text("(empty)", style="dim")
+        if abs(pos - self.cursor) > 1 and seg.text:
+            body.stylize("dim")
+        lane = body.wrap(self.console, lane_w)
         lines: List[Text] = []
         a = view.aseg_index(pos)
         if a is not None and (pos == 0 or view.aseg_index(pos - 1) != a):
             lines.append(Text(f"━━━ audio segment {a} ━━━", style="yellow"))
-        lines.append(head)
         body_offset = len(lines)
-        body = Text(seg.text) if seg.text else Text("(empty)", style="dim")
-        if abs(pos - self.cursor) > 1 and seg.text:
-            body.stylize("dim")
-        lines.extend(body.wrap(self.console, width))
+        gutter = [g1, g2]
+        for i in range(max(len(gutter), len(lane))):
+            row = gutter[i] if i < len(gutter) else Text("")
+            row.pad_right(max(0, gut_w - row.cell_len))
+            if i < len(lane):
+                row.append_text(lane[i])
+            lines.append(row)
         if pos == self.cursor:
             for ln in lines:
                 ln.pad_right(max(0, width - ln.cell_len))
                 ln.stylize("reverse")
         return lines, body_offset
+
+    @property
+    def _gutter_w(self) -> int:
+        """The source-wide gutter width: sized ONCE from the last segment (the widest
+        index + time span), so the text lane's indent never wobbles while walking."""
+        last = self.view.segments[-1]
+        t_w = (len(f"{last.end_time:.1f}–{last.end_time:.1f}s")
+               if last.end_time is not None else 0)
+        return max(t_w, len("(no audio)"), len(f"#{last.index}") + 4) + 2
 
     def _render(self) -> None:
         """Center-pinned paint (drive round 4): the focused card's FIRST TEXT LINE
@@ -149,6 +168,9 @@ class CorrectionApp(App):
         outward from it (one blank separator row) and absorb the height variance,
         clipping at the screen edges. The pin never moves — the spine flows past it."""
         view = self.view
+        if not view.size:
+            self.query_one("#status", Static).update(f"{view.source_title}  ·  empty spine")
+            return
         width = max(20, self.size.width)
         height = max(3, self.size.height - 1)   # the status line keeps the last row
         rows: List[Optional[Text]] = [None] * height
