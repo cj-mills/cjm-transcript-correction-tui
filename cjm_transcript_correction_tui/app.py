@@ -1,3 +1,4 @@
+import time
 from typing import Dict, List, Optional
 
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
@@ -38,10 +39,10 @@ class CorrectionApp(App):
         Binding("w", "prev", "prev", show=False),
         Binding("r", "replay", "replay"),
         Binding("e", "edit", "edit text"),
-        Binding("right_square_bracket", "shift_push", "] push word", key_display="]"),
-        Binding("right", "shift_push", "push word", show=False),
-        Binding("left_square_bracket", "shift_pull", "[ pull word", key_display="["),
-        Binding("left", "shift_pull", "pull word", show=False),
+        Binding("right", "shift_push", "push word", key_display="→"),
+        Binding("d", "shift_push", "push word", show=False),
+        Binding("left", "shift_pull", "pull word", key_display="←"),
+        Binding("a", "shift_pull", "pull word", show=False),
         Binding("space", "reviewed", "mark reviewed"),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
@@ -67,6 +68,7 @@ class CorrectionApp(App):
         self.session_id: Optional[str] = None
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
+        self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
         self._slots: List[Static] = []
 
     def compose(self) -> ComposeResult:
@@ -128,7 +130,7 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k·w/s walk · [ ]/←→ shift · r replay · e edit · space reviewed · q quit")
+            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · e edit · space reviewed · q quit")
 
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
@@ -201,12 +203,14 @@ class CorrectionApp(App):
         projection drops the moved text with the pruned position). Key-repeat
         is DROPPED while a commit is in flight, so a held key can only shift
         as fast as the screen shows it (first-drive feedback, 2026-07-12)."""
-        if self._shift_busy:
-            return
+        now = time.monotonic()
+        if self._shift_busy or now - self._last_shift < 0.15:
+            return  # busy commit OR inside the paint-rate floor — drop the repeat
         self._shift_busy = True
         try:
             await self._shift_boundary_now(direction)
         finally:
+            self._last_shift = time.monotonic()
             self._shift_busy = False
 
     async def _shift_boundary_now(self, direction: str) -> None:
