@@ -32,12 +32,16 @@ class CorrectionApp(App):
     BINDINGS = [
         Binding("j", "next", "next"),
         Binding("down", "next", "next", show=False),
+        Binding("s", "next", "next", show=False),
         Binding("k", "prev", "prev"),
         Binding("up", "prev", "prev", show=False),
+        Binding("w", "prev", "prev", show=False),
         Binding("r", "replay", "replay"),
         Binding("e", "edit", "edit text"),
         Binding("right_square_bracket", "shift_push", "] push word", key_display="]"),
+        Binding("right", "shift_push", "push word", show=False),
         Binding("left_square_bracket", "shift_pull", "[ pull word", key_display="["),
+        Binding("left", "shift_pull", "pull word", show=False),
         Binding("space", "reviewed", "mark reviewed"),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
@@ -62,6 +66,7 @@ class CorrectionApp(App):
         self.audio_device = audio_device
         self.session_id: Optional[str] = None
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
+        self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._slots: List[Static] = []
 
     def compose(self) -> ComposeResult:
@@ -123,7 +128,7 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k walk · r replay · e edit · [ ] shift word · space reviewed · q quit")
+            f"  ·  j/k·w/s walk · [ ]/←→ shift · r replay · e edit · space reviewed · q quit")
 
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
@@ -193,7 +198,18 @@ class CorrectionApp(App):
         Commits a boundary_shift Correction (word-level payload, layer 0.0.8
         semantics); when the RECEIVING segment is prune-covered, also commits
         the unprune amendment (the falsified-D14 rescue — without it the
-        projection drops the moved text with the pruned position)."""
+        projection drops the moved text with the pruned position). Key-repeat
+        is DROPPED while a commit is in flight, so a held key can only shift
+        as fast as the screen shows it (first-drive feedback, 2026-07-12)."""
+        if self._shift_busy:
+            return
+        self._shift_busy = True
+        try:
+            await self._shift_boundary_now(direction)
+        finally:
+            self._shift_busy = False
+
+    async def _shift_boundary_now(self, direction: str) -> None:
         view, i = self.view, self.cursor
         status = self.query_one("#status", Static)
         if i + 1 >= view.size:
