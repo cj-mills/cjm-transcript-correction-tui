@@ -26,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     p.add_argument("--audio-device", default=None,
                    help="Output device index or name substring (default: the system "
                         "default sink — pipewire/pulse routing when available)")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Start at segment 0 instead of the source's last-focused segment")
+    p.add_argument("--shift-floor-ms", type=int, default=80,
+                   help="Minimum milliseconds between held-key boundary shifts "
+                        "(measure your key rates with tests_manual/keyrate_probe.py)")
     return p
 
 
@@ -38,6 +43,7 @@ def main() -> int:  # Console-script entry point
     app = CorrectionApp(args.graph_db_path, source=args.source,
                         manifests_dir=args.manifests_dir, rendition=args.rendition,
                         actor=args.actor, autoplay=not args.no_autoplay,
-                        audio_device=device)
+                        audio_device=device, resume=not args.no_resume,
+                        shift_floor_s=args.shift_floor_ms / 1000.0)
     app.run()
     return 0

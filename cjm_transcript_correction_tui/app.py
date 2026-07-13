@@ -1,5 +1,7 @@
+import json
 import time
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_prune_amendment, commit_text_correction,
@@ -54,7 +56,9 @@ class CorrectionApp(App):
                  rendition: Optional[str] = None,         # Rendition selector (None = auto)
                  actor: str = "human",                    # Actor recorded on corrections
                  autoplay: bool = True,                   # Auto-play the focused chunk
-                 audio_device: Optional[object] = None):  # Output device (None = system default)
+                 audio_device: Optional[object] = None,   # Output device (None = system default)
+                 resume: bool = True,                     # Reopen at the source's last-focused segment
+                 shift_floor_s: float = 0.08):            # Min seconds between held-key boundary shifts
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition)
@@ -69,6 +73,9 @@ class CorrectionApp(App):
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
+        self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
+        self.resume = resume
+        self._state_saved = 0.0            # last sidecar bookmark write (monotonic; 1s throttle)
         self._slots: List[Static] = []
 
     def compose(self) -> ComposeResult:
@@ -84,6 +91,10 @@ class CorrectionApp(App):
         sess = await start_session(self.view.queue, self.view.graph_id,
                                    [self.view.source_id])
         self.session_id = sess.id
+        if self.resume:
+            saved = load_tui_state(self._graph_db_path).get(self.view.source_id)
+            if saved and self.view.size:
+                self.cursor = max(0, min(self.view.size - 1, int(saved.get("cursor", 0))))
         await self._build_slots()
         self._render()
         if self.autoplay:
@@ -144,6 +155,10 @@ class CorrectionApp(App):
         if new == self.cursor:
             return
         self.cursor = new
+        now = time.monotonic()
+        if now - self._state_saved > 1.0:   # bookmark survives crashes, not just quits
+            save_tui_state(self._graph_db_path, self.view.source_id, new)
+            self._state_saved = now
         self._render()
         if self.autoplay:
             self._play_cursor()
@@ -204,7 +219,7 @@ class CorrectionApp(App):
         is DROPPED while a commit is in flight, so a held key can only shift
         as fast as the screen shows it (first-drive feedback, 2026-07-12)."""
         now = time.monotonic()
-        if self._shift_busy or now - self._last_shift < 0.15:
+        if self._shift_busy or now - self._last_shift < self._shift_floor:
             return  # busy commit OR inside the paint-rate floor — drop the repeat
         self._shift_busy = True
         try:
@@ -256,8 +271,39 @@ class CorrectionApp(App):
             self.player.stop()
 
     async def action_quit_app(self) -> None:
+        if self.view is not None:
+            save_tui_state(self._graph_db_path, self.view.source_id, self.cursor)
         if self.player is not None:
             self.player.close()
         if self.view is not None:
             await self.view.close()
         self.exit()
+
+
+def load_tui_state(
+    graph_db_path: str,  # The graph db whose sidecar state file to read
+) -> Dict[str, Any]:  # {source_id: {"cursor": int, "ts": float}}; empty when absent/corrupt
+    """Read the per-graph TUI sidecar state (last-focused positions)."""
+    try:
+        return json.loads(Path(f"{graph_db_path}.tui-state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_tui_state(
+    graph_db_path: str,  # The graph db whose sidecar state file to write
+    source_id: str,      # Source whose position is being remembered
+    cursor: int,         # Last-focused segment position
+) -> None:
+    """Merge one source's last-focused position into the sidecar state file.
+
+    VIEW state, not knowledge — it lives in a local sidecar next to the db,
+    never as a graph write (the cursor is where the eye was, not a decision).
+    Write failures are silently tolerated: losing a bookmark must never break
+    the correction loop."""
+    state = load_tui_state(graph_db_path)
+    state[source_id] = {"cursor": int(cursor), "ts": time.time()}
+    try:
+        Path(f"{graph_db_path}.tui-state.json").write_text(json.dumps(state, indent=1))
+    except OSError:
+        pass
