@@ -37,6 +37,8 @@ class CorrectionApp(App):
 
     AUTO_FOCUS = None  # the hidden editor Input must not swallow the walk keys at mount
 
+    SPEEDS = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)  # the [ ] playback-rate ladder
+
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
     """
@@ -49,6 +51,8 @@ class CorrectionApp(App):
         Binding("up", "prev", "prev", show=False),
         Binding("w", "prev", "prev", show=False),
         Binding("r", "replay", "replay"),
+        Binding("left_square_bracket", "speed_down", "slower", key_display="["),
+        Binding("right_square_bracket", "speed_up", "faster", key_display="]"),
         Binding("e", "edit", "edit text"),
         Binding("y", "yank", "copy text"),
         Binding("right", "shift_push", "push word", key_display="→"),
@@ -78,6 +82,7 @@ class CorrectionApp(App):
         self.cursor = 0
         self.actor = actor
         self.autoplay = autoplay
+        self.speed = 1.0                   # playback rate ([ ] preset ladder; sidecar-persisted preference)
         self.audio_device = audio_device
         self.session_id: Optional[str] = None
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
@@ -100,8 +105,14 @@ class CorrectionApp(App):
         sess = await start_session(self.view.queue, self.view.graph_id,
                                    [self.view.source_id])
         self.session_id = sess.id
+        state = load_tui_state(self._graph_db_path)
+        try:
+            # Speed is a PREFERENCE, not a position — restored even with resume=False.
+            self.speed = float(state.get("_speed") or 1.0)
+        except (TypeError, ValueError):
+            self.speed = 1.0
         if self.resume:
-            saved = load_tui_state(self._graph_db_path).get(self.view.source_id)
+            saved = state.get(self.view.source_id)
             if saved and self.view.size:
                 self.cursor = max(0, min(self.view.size - 1, int(saved.get("cursor", 0))))
         self._render()
@@ -205,15 +216,16 @@ class CorrectionApp(App):
         done = sum(1 for v in self._marks.values() if v)
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
-            f"  ·  marked {done}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · e edit · y copy · space reviewed · q quit")
+            f"  ·  marked {done}  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
+            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · [/] speed · e edit · y copy"
+            f" · space reviewed · q quit")
 
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
         if c is None:
             self.player.stop()
             return
-        self.player.play(load_chunk(c.wav_path, c.start_s, c.end_s))
+        self.player.play(load_chunk(c.wav_path, c.start_s, c.end_s, speed=self.speed))
 
     def _move(self, delta: int) -> None:
         new = max(0, min(self.view.size - 1, self.cursor + delta))
@@ -242,6 +254,23 @@ class CorrectionApp(App):
 
     def action_replay(self) -> None:
         self._play_cursor()
+
+    def _step_speed(self, delta: int) -> None:
+        """Step the playback rate along the preset ladder, re-sound the chunk at the
+        new rate (immediate audible confirmation), persist the preference (sidecar —
+        view state like the cursor bookmark, never a graph write)."""
+        i = min(range(len(self.SPEEDS)), key=lambda j: abs(self.SPEEDS[j] - self.speed))
+        self.speed = self.SPEEDS[max(0, min(len(self.SPEEDS) - 1, i + delta))]
+        save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
+                       speed=self.speed)
+        self._render()
+        self._play_cursor()
+
+    def action_speed_down(self) -> None:
+        self._step_speed(-1)
+
+    def action_speed_up(self) -> None:
+        self._step_speed(1)
 
     def action_yank(self) -> None:
         """Copy the focused segment's effective text to the system clipboard —
@@ -380,7 +409,8 @@ class CorrectionApp(App):
 
     async def action_quit_app(self) -> None:
         if self.view is not None:
-            save_tui_state(self._graph_db_path, self.view.source_id, self.cursor)
+            save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
+                           speed=self.speed)
         if self.player is not None:
             self.player.close()
         if self.view is not None:
@@ -402,6 +432,7 @@ def save_tui_state(
     graph_db_path: str,  # The graph db whose sidecar state file to write
     source_id: str,      # Source whose position is being remembered
     cursor: int,         # Last-focused segment position
+    speed: Optional[float] = None,  # Playback-rate preference (db-wide `_speed`; None = leave as-is)
 ) -> None:
     """Merge one source's last-focused position into the sidecar state file.
 
@@ -411,6 +442,8 @@ def save_tui_state(
     the correction loop."""
     state = load_tui_state(graph_db_path)
     state[source_id] = {"cursor": int(cursor), "ts": time.time()}
+    if speed is not None:
+        state["_speed"] = float(speed)
     try:
         Path(f"{graph_db_path}.tui-state.json").write_text(json.dumps(state, indent=1))
     except OSError:

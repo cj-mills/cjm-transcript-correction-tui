@@ -15,9 +15,9 @@ def load_chunk(
     """Read one VAD chunk's samples from the model-input WAV — frame-sliced, sample-accurate.
 
     The correction loop verifies against WHAT THE MODEL HEARD, so the slice always
-    comes from the model-input rendition, never the source media. Speed control is an
-    offline resample of the chunk (near-free at 16 kHz mono), so the persistent output
-    stream never changes rate."""
+    comes from the model-input rendition, never the source media. Speed control is a
+    pitch-preserving WSOLA time-stretch of the chunk (`stretch`, offline) — the
+    persistent output stream never changes rate and the voice never chipmunks."""
     with sf.SoundFile(wav_path) as f:
         start = max(0, int(round(start_s * f.samplerate)))
         stop = min(len(f), int(round(end_s * f.samplerate)))
@@ -26,9 +26,7 @@ def load_chunk(
     if data.ndim > 1:  # defensive: model input is mono, but never trust a file
         data = data.mean(axis=1)
     if speed != 1.0 and len(data):
-        n = max(1, int(round(len(data) / speed)))
-        data = np.interp(np.linspace(0.0, len(data) - 1.0, n),
-                         np.arange(len(data)), data).astype(np.float32)
+        data = stretch(data, speed)
     return data
 
 
@@ -116,3 +114,52 @@ class ChunkPlayer:
         """Tear down the stream (app exit)."""
         self._stream.stop()
         self._stream.close()
+
+
+def stretch(
+    samples: np.ndarray,   # float32 mono samples at the model-input rate
+    speed: float,          # Playback rate (>1 = faster, <1 = slower); 1.0 = untouched
+    frame: int = 512,      # Analysis frame (~32 ms @ 16 kHz)
+) -> np.ndarray:  # float32 mono, ~len(samples)/speed samples, SAME pitch
+    """Pitch-preserving time-stretch (WSOLA, numpy-only) — the playback-speed engine.
+
+    Listening speed is a comprehension lever, not a pitch transform: a linear
+    resample would chipmunk the voice, so windowed frames are overlap-added at
+    the synthesis hop while ANALYSIS positions advance at `speed`x, each frame
+    snapped (±tol cross-correlation) to the natural continuation of the frame
+    already emitted. Numpy-only on purpose (the maintained TSM deps are heavier
+    than the ~25 lines they'd replace). Offline like every other chunk
+    transform — the persistent output stream never changes rate."""
+    n = len(samples)
+    if speed == 1.0 or n < frame * 2:
+        return samples
+    hop_syn = frame // 2
+    hop_ana = hop_syn * float(speed)
+    tol = frame // 4
+    win = np.hanning(frame).astype(np.float32)
+    n_out = int(n / speed)
+    out = np.zeros(n_out + frame, dtype=np.float32)
+    norm = np.zeros(n_out + frame, dtype=np.float32)
+    ref_at = 0   # where the previous frame's natural continuation starts
+    pos = 0      # synthesis write position
+    k = 0
+    while pos + frame <= n_out:
+        center = int(round(k * hop_ana))
+        if center + frame + tol >= n:
+            break
+        if k == 0:
+            best = 0
+        else:
+            lo = max(0, center - tol)
+            hi = min(n - frame, center + tol)
+            target = samples[ref_at:ref_at + frame]
+            corr = np.correlate(samples[lo:hi + frame], target, mode="valid")
+            best = lo + int(np.argmax(corr))
+        out[pos:pos + frame] += samples[best:best + frame] * win
+        norm[pos:pos + frame] += win
+        ref_at = min(best + hop_syn, n - frame)
+        pos += hop_syn
+        k += 1
+    nz = norm > 1e-6
+    out[nz] /= norm[nz]
+    return out[:pos].astype(np.float32)
