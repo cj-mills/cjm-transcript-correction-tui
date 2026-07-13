@@ -48,6 +48,7 @@ class CorrectionApp(App):
         Binding("w", "prev", "prev", show=False),
         Binding("r", "replay", "replay"),
         Binding("e", "edit", "edit text"),
+        Binding("y", "yank", "copy text"),
         Binding("right", "shift_push", "push word", key_display="→"),
         Binding("d", "shift_push", "push word", show=False),
         Binding("left", "shift_pull", "pull word", key_display="←"),
@@ -176,7 +177,7 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · e edit · space reviewed · q quit")
+            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · e edit · y copy · space reviewed · q quit")
 
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
@@ -212,6 +213,14 @@ class CorrectionApp(App):
 
     def action_replay(self) -> None:
         self._play_cursor()
+
+    def action_yank(self) -> None:
+        """Copy the focused segment's effective text to the system clipboard
+        (OSC 52) — sharing a segment must not require a screenshot or re-typing."""
+        seg = self.view.segments[self.cursor]
+        self.copy_to_clipboard(seg.text)
+        self.query_one("#status", Static).update(
+            f"copied segment #{seg.index} text ({len(seg.text)} chars)")
 
     def action_edit(self) -> None:
         editor = self.query_one("#editor", Input)
