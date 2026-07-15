@@ -5,10 +5,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cjm_context_graph_layer.journal import sidecar_journal_path
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_prune_amendment, commit_text_correction,
                                                   record_review_markers, start_session)
-from cjm_transcript_correction_core.journal import sidecar_journal_path
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding

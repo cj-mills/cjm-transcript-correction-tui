@@ -39,4 +39,4 @@ The minimal presentation driver for cjm-transcript-correction-core: a document-o
 
 ## Dependencies
 
-**Depends on:** `cjm-transcript-correction-core`, `numpy`, `sounddevice`, `soundfile`, `textual`
+**Depends on:** `cjm-context-graph-layer`, `cjm-transcript-correction-core`, `numpy`, `sounddevice`, `soundfile`, `textual`

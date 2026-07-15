@@ -15,7 +15,8 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-    'cjm-transcript-correction-core',
+    'cjm-transcript-correction-core>=0.0.3',
+    'cjm-context-graph-layer>=0.0.10',
     'textual',
     'numpy',
     'sounddevice',
