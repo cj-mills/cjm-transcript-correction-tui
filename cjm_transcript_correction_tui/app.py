@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_prune_amendment, commit_text_correction,
                                                   record_review_markers, start_session)
+from cjm_transcript_correction_core.journal import sidecar_journal_path
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -72,11 +73,13 @@ class CorrectionApp(App):
                  autoplay: bool = True,                   # Auto-play the focused chunk
                  audio_device: Optional[object] = None,   # Output device (None = system default)
                  resume: bool = True,                     # Reopen at the source's last-focused segment
-                 shift_floor_s: float = 0.001):           # Min seconds between held-key boundary shifts (commit latency is the real governor)
+                 shift_floor_s: float = 0.0):             # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition)
         self._graph_db_path = graph_db_path
+        # Every correction write appends through to the db's sidecar journal (DEC ccbab9f5).
+        self._journal_path = sidecar_journal_path(graph_db_path)
         self.view: Optional[SpineView] = None
         self.player: Optional[ChunkPlayer] = None
         self.cursor = 0
@@ -103,7 +106,8 @@ class CorrectionApp(App):
         self.view = await SpineView.open(self._graph_db_path, **self._open_kwargs)
         self.player = ChunkPlayer(device=self.audio_device)
         sess = await start_session(self.view.queue, self.view.graph_id,
-                                   [self.view.source_id])
+                                   [self.view.source_id],
+                                   journal_path=self._journal_path)
         self.session_id = sess.id
         state = load_tui_state(self._graph_db_path)
         try:
@@ -313,7 +317,8 @@ class CorrectionApp(App):
             await commit_text_correction(
                 self.view.queue, self.view.graph_id, self.view.source_id,
                 seg.id, new_text, self.session_id,
-                old_text=seg.text, actor=self.actor)
+                old_text=seg.text, actor=self.actor,
+                journal_path=self._journal_path)
             seg.text = new_text          # local echo of the new effective text
             self._marks[self.cursor] = "corrected"
         # A text-bearing PRUNED position must leave the prune set (the same
@@ -325,7 +330,8 @@ class CorrectionApp(App):
             if prior is not None:
                 amended = await commit_prune_amendment(
                     self.view.queue, self.view.graph_id, prior, [seg.id],
-                    self.session_id, actor=self.actor)
+                    self.session_id, actor=self.actor,
+                    journal_path=self._journal_path)
                 self.view.unprune_local(prior["id"], amended)
                 self._marks[self.cursor] = "corrected"
         self._close_editor()
@@ -339,7 +345,8 @@ class CorrectionApp(App):
     async def action_reviewed(self) -> None:
         seg = self.view.segments[self.cursor]
         await record_review_markers(self.view.queue, self.view.graph_id,
-                                    self.session_id, [(seg.id, "reviewed")])
+                                    self.session_id, [(seg.id, "reviewed")],
+                                    journal_path=self._journal_path)
         self._marks.setdefault(self.cursor, "reviewed")
         self._move(1)
 
@@ -379,14 +386,16 @@ class CorrectionApp(App):
         moved, new_left, new_right = plan
         await commit_boundary_shift_correction(
             view.queue, view.graph_id, view.source_id, left.id, right.id,
-            moved, direction, self.session_id, actor=self.actor)
+            moved, direction, self.session_id, actor=self.actor,
+            journal_path=self._journal_path)
         receiver = right if direction == "push" else left
         if receiver.id in view.pruned_ids:
             prior = view.prune_correction_for(receiver.id)
             if prior is not None:
                 amended = await commit_prune_amendment(
                     view.queue, view.graph_id, prior, [receiver.id],
-                    self.session_id, actor=self.actor)
+                    self.session_id, actor=self.actor,
+                    journal_path=self._journal_path)
                 view.unprune_local(prior["id"], amended)
         left.text, right.text = new_left, new_right   # local echo (same math as the layer)
         self._marks[i] = "corrected"

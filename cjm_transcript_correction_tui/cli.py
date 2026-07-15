@@ -28,9 +28,11 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "default sink — pipewire/pulse routing when available)")
     p.add_argument("--no-resume", action="store_true",
                    help="Start at segment 0 instead of the source's last-focused segment")
-    p.add_argument("--shift-floor-ms", type=int, default=1,
-                   help="Minimum milliseconds between held-key boundary shifts "
-                        "(measure your key rates with tests_manual/keyrate_probe.py)")
+    p.add_argument("--shift-floor-ms", type=int, default=0,
+                   help="Minimum milliseconds between held-key boundary shifts; 0 = ungoverned "
+                        "(the async commit guard is the real governor — a 1ms floor read as "
+                        "residual keystroke latency in the 2026-07-14 drive). "
+                        "Measure key rates with tests_manual/keyrate_probe.py")
     return p
 
 
