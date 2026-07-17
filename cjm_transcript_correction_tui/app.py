@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.journal import sidecar_journal_path
+from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk
 from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_prune_amendment, commit_text_correction,
@@ -13,7 +14,6 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .audio import ChunkPlayer, load_chunk
 from .spine import plan_boundary_shift, SpineView
 
 
