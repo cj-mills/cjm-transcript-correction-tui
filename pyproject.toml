@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     'cjm-transcript-correction-core>=0.0.3',
     'cjm-context-graph-layer>=0.0.10',
+    'cjm-substrate-tui-kit>=0.0.1',
     'textual',
     'numpy',
     'sounddevice',

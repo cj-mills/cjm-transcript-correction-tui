@@ -1,11 +1,10 @@
-import json
 import shutil
 import subprocess
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.journal import sidecar_journal_path
+from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_prune_amendment, commit_text_correction,
                                                   record_review_markers, start_session)
@@ -431,10 +430,7 @@ def load_tui_state(
     graph_db_path: str,  # The graph db whose sidecar state file to read
 ) -> Dict[str, Any]:  # {source_id: {"cursor": int, "ts": float}}; empty when absent/corrupt
     """Read the per-graph TUI sidecar state (last-focused positions)."""
-    try:
-        return json.loads(Path(f"{graph_db_path}.tui-state.json").read_text())
-    except (OSError, ValueError):
-        return {}
+    return SidecarState(f"{graph_db_path}.tui-state.json").load()
 
 
 def save_tui_state(
@@ -449,11 +445,9 @@ def save_tui_state(
     never as a graph write (the cursor is where the eye was, not a decision).
     Write failures are silently tolerated: losing a bookmark must never break
     the correction loop."""
-    state = load_tui_state(graph_db_path)
+    store = SidecarState(f"{graph_db_path}.tui-state.json")
+    state = store.load()
     state[source_id] = {"cursor": int(cursor), "ts": time.time()}
     if speed is not None:
         state["_speed"] = float(speed)
-    try:
-        Path(f"{graph_db_path}.tui-state.json").write_text(json.dumps(state, indent=1))
-    except OSError:
-        pass
+    store.write(state)
