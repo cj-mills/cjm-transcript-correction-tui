@@ -7,14 +7,16 @@ from cjm_context_graph_layer.journal import sidecar_journal_path
 from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk
 from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
+                                                  commit_mark_correction, commit_mark_dismissal,
                                                   commit_prune_amendment, commit_text_correction,
                                                   record_review_markers, start_session)
+from cjm_transcript_correction_core.models import RECOMMENDED_MARK_CLASSES
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .spine import plan_boundary_shift, SpineView
+from .spine import parse_mark_input, plan_boundary_shift, resolve_mark_class_token, SpineView
 
 
 class CorrectionApp(App):
@@ -60,6 +62,14 @@ class CorrectionApp(App):
         Binding("left", "shift_pull", "pull word", key_display="←"),
         Binding("a", "shift_pull", "pull word", show=False),
         Binding("space", "reviewed", "mark reviewed"),
+        Binding("u", "unreview", "un-review"),
+        Binding("m", "mark_quick", "mark"),
+        Binding("b", "mark_boundary", "mark boundary"),
+        Binding("M", "mark_editor", "mark+class"),
+        Binding("n", "next_mark", "next mark"),
+        Binding("N", "prev_mark", "prev mark"),
+        Binding("p", "next_prune", "next prune"),
+        Binding("P", "prev_prune", "prev prune"),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
     ]
@@ -88,6 +98,8 @@ class CorrectionApp(App):
         self.audio_device = audio_device
         self.session_id: Optional[str] = None
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
+        self._mark_class = "suspect"       # last-used ⚑ class (m/b repeat it; sidecar-persisted)
+        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark")
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
         self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
@@ -114,6 +126,8 @@ class CorrectionApp(App):
             self.speed = float(state.get("_speed") or 1.0)
         except (TypeError, ValueError):
             self.speed = 1.0
+        mc = str(state.get("_mark_class") or "suspect")
+        self._mark_class = mc if mc[:1].isalnum() else "suspect"   # heal a junk-class sidecar
         if self.resume:
             saved = state.get(self.view.source_id)
             if saved and self.view.size:
@@ -147,6 +161,8 @@ class CorrectionApp(App):
         g1.append(f"#{seg.index} {mark}", style="dim")
         if seg.id in view.pruned_ids:
             g1.append(" ✂", style="red")
+        if seg.id in view.marked_ids:
+            g1.append(" ⚑", style="yellow")
         g2 = Text()
         g2.append(f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
                   if seg.start_time is not None else "(no audio)", style="dim")
@@ -179,7 +195,7 @@ class CorrectionApp(App):
         last = self.view.segments[-1]
         t_w = (len(f"{last.end_time:.1f}–{last.end_time:.1f}s")
                if last.end_time is not None else 0)
-        return max(t_w, len("(no audio)"), len(f"#{last.index}") + 4) + 2
+        return max(t_w, len("(no audio)"), len(f"#{last.index}") + 6) + 2  # +6: the ✓/✂/⚑ glyph rail
 
     def _render(self) -> None:
         """Center-pinned paint (drive round 4): the focused card's FIRST TEXT LINE
@@ -221,7 +237,7 @@ class CorrectionApp(App):
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
             f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · \\[/] speed · e edit · y copy"
-            f" · space reviewed · q quit")
+            f" · space/u ±reviewed · m/b/M ⚑mark · n/N⚑ p/P✂ jump · q quit")
 
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
@@ -305,11 +321,15 @@ class CorrectionApp(App):
 
     def action_edit(self) -> None:
         editor = self.query_one("#editor", Input)
+        self._input_mode = "edit"
         editor.value = self.view.segments[self.cursor].text
         editor.display = True
         editor.focus()
 
     async def on_input_submitted(self, event) -> None:
+        if self._input_mode == "mark":
+            await self._submit_mark(event.value)
+            return
         seg = self.view.segments[self.cursor]
         new_text = event.value
         if new_text != seg.text:
@@ -340,6 +360,7 @@ class CorrectionApp(App):
         editor = self.query_one("#editor", Input)
         editor.display = False
         self.set_focus(None)
+        self._input_mode = "edit"
 
     async def action_reviewed(self) -> None:
         seg = self.view.segments[self.cursor]
@@ -348,6 +369,23 @@ class CorrectionApp(App):
                                     journal_path=self._journal_path)
         self._marks.setdefault(self.cursor, "reviewed")
         self._move(1)
+
+    async def action_unreview(self) -> None:
+        """u: undo an accidental space — appends an 'unreviewed' RE-DECISION
+        (review markers are events; the read is latest-wins), so the segment
+        returns to undecided for this session. Committed corrections are NOT
+        touched: undo those by supersession (re-edit / the opposite shift)."""
+        seg = self.view.segments[self.cursor]
+        await record_review_markers(self.view.queue, self.view.graph_id,
+                                    self.session_id, [(seg.id, "unreviewed")],
+                                    journal_path=self._journal_path)
+        was = self._marks.get(self.cursor)
+        if was == "reviewed":
+            self._marks.pop(self.cursor, None)
+        self._render()
+        note = ("" if was != "corrected"
+                else " (corrections stay — supersede via re-edit / opposite shift)")
+        self.query_one("#status", Static).update(f"un-reviewed #{seg.index}{note}")
 
     async def _shift_boundary(self, direction: str) -> None:
         """One [ / ] press: move ONE word across the boundary AFTER the cursor.
@@ -407,6 +445,152 @@ class CorrectionApp(App):
     async def action_shift_pull(self) -> None:
         await self._shift_boundary("pull")
 
+    def _jump_glyph(self, direction: int, ids: set, what: str) -> None:
+        """n/N (⚑), p/P (✂): cursor to the next/previous segment in a glyph id
+        set (wraps) — resolution passes walk glyphs directly instead of
+        scanning thousands of segments (drive find: had to dig for a ✂)."""
+        view = self.view
+        if not ids:
+            self.query_one("#status", Static).update(f"no {what} segments on this source")
+            return
+        for step in range(1, view.size + 1):
+            j = (self.cursor + direction * step) % view.size
+            if view.segments[j].id in ids:
+                self._move(j - self.cursor)
+                return
+
+    def action_next_mark(self) -> None:
+        self._jump_glyph(1, self.view.marked_ids, "⚑ marked")
+
+    def action_prev_mark(self) -> None:
+        self._jump_glyph(-1, self.view.marked_ids, "⚑ marked")
+
+    def action_next_prune(self) -> None:
+        self._jump_glyph(1, self.view.pruned_ids, "✂ pruned")
+
+    def action_prev_prune(self) -> None:
+        self._jump_glyph(-1, self.view.pruned_ids, "✂ pruned")
+
+    def _mark_class_menu(self) -> List[str]:
+        """Selectable classes for the M picker: the recommended slate first, then
+        classes carried by this source's OPEN marks — dismissing a class's last
+        open mark removes it (junk cleanup); proven classes persist by promotion
+        into RECOMMENDED_MARK_CLASSES (open vocab, DEC 2a231843)."""
+        return list(RECOMMENDED_MARK_CLASSES) + [
+            c for c in self.view.seen_mark_classes if c not in RECOMMENDED_MARK_CLASSES]
+
+    async def action_mark_quick(self) -> None:
+        """m: mark the focused segment with the last-used class and keep walking —
+        the held-back-corrections gesture (DEC 42854519) must cost one keystroke."""
+        seg = self.view.segments[self.cursor]
+        await self._commit_mark({"kind": "segment", "segment_id": seg.id},
+                                self._mark_class, None)
+
+    async def action_mark_boundary(self) -> None:
+        """b: mark the boundary AFTER the cursor (the shift gesture's coordinates).
+
+        Unlike shifts, audio-segment seams are NOT refused — a suspect seam is
+        exactly what a boundary mark is for."""
+        view, i = self.view, self.cursor
+        if i + 1 >= view.size:
+            self.query_one("#status", Static).update("boundary mark: no segment after the cursor")
+            return
+        await self._commit_mark({"kind": "boundary",
+                                 "boundary_after": view.segments[i].id,
+                                 "right_segment_id": view.segments[i + 1].id},
+                                self._mark_class, None)
+
+    def action_mark_editor(self) -> None:
+        """M: class-picker mark — `class-or-# ["snippet"] [note...]`: a leading
+        digit picks from the numbered class menu (recommended slate + this
+        source's journaled classes); a snippet found in the segment text becomes
+        a SPAN anchor; a punctuation-led token dismisses ALL open marks at the
+        cursor."""
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "mark"
+        editor.value = f"{self._mark_class} "
+        editor.display = True
+        editor.focus()
+        menu = self._mark_class_menu()
+        self.query_one("#status", Static).update(
+            'mark: class-or-# ["snippet"] [note] · - dismiss · '
+            + " ".join(f"{i + 1}:{c}" for i, c in enumerate(menu)))
+
+    async def _submit_mark(self, raw: str) -> None:
+        seg = self.view.segments[self.cursor]
+        self._close_editor()
+        tokens = raw.split()
+        if not tokens:
+            self._render()
+            return
+        first = tokens[0].strip('`"\'')
+        if first.startswith("-") or not first:
+            # Dismissal gesture, tolerant of formatting fumbles ('`-`', '- oops'):
+            # a punctuation-led token must never mint a junk class and hijack the
+            # last-used class (drive find, 2026-07-19). ALL open marks at the
+            # cursor go — the ⚑ must actually clear (boundary marks from a
+            # neighbor's b press anchor this segment too).
+            marks = self.view.marks_for(seg.id)
+            if not marks:
+                self._render()
+                self.query_one("#status", Static).update(f"no open mark on #{seg.index}")
+                return
+            for m in marks:
+                await commit_mark_dismissal(
+                    self.view.queue, self.view.graph_id, self.view.source_id,
+                    m["id"], self.session_id, actor=self.actor,
+                    journal_path=self._journal_path)
+                self.view.dismiss_mark_local(m["id"])
+            classes = ", ".join(str((m.get("payload") or {}).get("mark_class")) for m in marks)
+            self._render()
+            self.query_one("#status", Static).update(
+                f"dismissed {len(marks)} mark(s) on #{seg.index} [{classes}]")
+            return
+        raw, err = resolve_mark_class_token(raw, self._mark_class_menu())
+        if err:
+            self._render()
+            self.query_one("#status", Static).update(f"mark: {err}")
+            return
+        parsed = parse_mark_input(raw, seg.text)
+        if parsed is None:
+            self._render()
+            return
+        mark_class, span, note = parsed
+        if span is not None:
+            start, end, snapshot = span
+            anchor = {"kind": "span", "segment_id": seg.id, "char_start": start,
+                      "char_end": end, "text_snapshot": snapshot}
+        else:
+            anchor = {"kind": "segment", "segment_id": seg.id}
+        await self._commit_mark(anchor, mark_class, note)
+
+    async def _commit_mark(self, anchor: Dict[str, Any], mark_class: str,
+                           note: Optional[str]) -> None:
+        """Commit one mark Correction + local echo (the ⚑ paints immediately).
+
+        A mark records attention, not a decision: no review marker, no text
+        change, the cursor stays put — mark and keep walking."""
+        try:
+            mark_id = await commit_mark_correction(
+                self.view.queue, self.view.graph_id, self.view.source_id,
+                anchor, mark_class, self.session_id, actor=self.actor, note=note,
+                journal_path=self._journal_path)
+        except ValueError as e:
+            self._render()
+            self.query_one("#status", Static).update(f"mark refused: {e}")
+            return
+        self._mark_class = mark_class
+        save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
+                       mark_class=mark_class)
+        self.view.add_mark_local({"id": mark_id, "correction_type": "mark",
+                                  "payload": {"operation": "mark", "anchor": dict(anchor),
+                                              "mark_class": mark_class}})
+        self._render()
+        seg = self.view.segments[self.cursor]
+        suffix = f" — {note}" if note else ""
+        self.query_one("#status", Static).update(
+            f"⚑ #{seg.index} [{mark_class}] ({anchor['kind']}){suffix}")
+
     def action_cancel(self) -> None:
         editor = self.query_one("#editor", Input)
         if editor.display:
@@ -438,6 +622,7 @@ def save_tui_state(
     source_id: str,      # Source whose position is being remembered
     cursor: int,         # Last-focused segment position
     speed: Optional[float] = None,  # Playback-rate preference (db-wide `_speed`; None = leave as-is)
+    mark_class: Optional[str] = None,  # Last-used ⚑ class (db-wide `_mark_class`; None = leave as-is)
 ) -> None:
     """Merge one source's last-focused position into the sidecar state file.
 
@@ -450,4 +635,6 @@ def save_tui_state(
     state[source_id] = {"cursor": int(cursor), "ts": time.time()}
     if speed is not None:
         state["_speed"] = float(speed)
+    if mark_class is not None:
+        state["_mark_class"] = str(mark_class)
     store.write(state)

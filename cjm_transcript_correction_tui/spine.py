@@ -10,7 +10,8 @@ from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_transcript_correction_core.cli import load_capabilities
 from cjm_transcript_correction_core.graph import (active_corrections, load_source_corrections,
-                                                  load_source_segments, project_effective_spine,
+                                                  load_source_segments, mark_anchor_segments,
+                                                  open_marks, project_effective_spine,
                                                   resolve_source_renditions)
 from cjm_transcript_correction_core.models import SpineSegment
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
@@ -38,9 +39,10 @@ class SpineView:
     active corrections — the SAME read every downstream consumer gets), and joins
     each Segment to its model-input WAV chunk. The TUI renders WINDOWS of this view
     (`window(cursor, count)` — scrolling moves the CURSOR, slots re-bind around it;
-    there is no viewport state) and slices audio via `chunk(i)`. Reads come through
-    correction-core's operation vocabulary; writes will too — the TUI never touches
-    the graph directly."""
+    there is no viewport state) and slices audio via `chunk(i)`. Open MARKS load
+    with the corrections (⚑ bookkeeping only — they never touch the projection).
+    Reads come through correction-core's operation vocabulary; writes too — the
+    TUI never touches the graph directly."""
 
     def __init__(self, manager: CapabilityManager, queue: JobQueue, graph_id: str,
                  source_id: str, source_title: str):
@@ -52,6 +54,9 @@ class SpineView:
         self.segments: List[SpineSegment] = []       # Full-skeleton effective spine (text edits applied, prunes marked)
         self.pruned_ids: set = set()                 # Segment ids a prune correction targets (card marks)
         self._prune_corrections: List[dict] = []     # Active prune Corrections (unprune anchors)
+        self._open_marks: List[dict] = []            # OPEN mark Corrections (routed attention)
+        self.marked_ids: set = set()                 # Segment ids an open mark anchors (⚑ glyphs)
+        self.seen_mark_classes: List[str] = []       # DISTINCT classes journaled on this source (open or discharged)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
 
@@ -95,6 +100,10 @@ class SpineView:
         corrections, superseded = await load_source_corrections(
             self.queue, self.graph_id, self.source_id)
         active = active_corrections(corrections, superseded)
+        # Open marks paint ⚑ in the walk; they NEVER touch the projection
+        # (corrections_to_edits has no arm for correction_type "mark" — DEC 2a231843).
+        self._open_marks = open_marks(corrections, superseded)
+        self._recompute_marked_ids()
         # The correction surface walks the FULL VAD skeleton (the 1:1 invariant):
         # prune corrections are NOT applied to this view — an "empty" chunk may hold
         # speech that FA starved (the falsified D14 premise), and an empty chunk is
@@ -184,6 +193,46 @@ class SpineView:
             sid for c in self._prune_corrections
             for sid in (c.get("payload") or {}).get("pruned_segment_ids") or []}
 
+    def _recompute_marked_ids(self) -> None:
+        """Re-derive the ⚑ id set + observed class list from the OPEN marks
+        (load + local echoes). A class leaves the picker menu when its last
+        open mark on this source is discharged — junk classes clean up via
+        dismissal; proven classes persist by PROMOTION into the recommended
+        slate, never by haunting the menu from discharged marks."""
+        self.marked_ids = set()
+        for m in self._open_marks:
+            try:
+                self.marked_ids.update(mark_anchor_segments(
+                    (m.get("payload") or {}).get("anchor") or {}))
+            except ValueError:
+                continue   # malformed historical mark: skip its glyph, never break the walk
+        self.seen_mark_classes = sorted({
+            str((m.get("payload") or {}).get("mark_class"))
+            for m in self._open_marks
+            if (m.get("payload") or {}).get("mark_class")})
+
+    def marks_for(self, segment_id: str) -> List[dict]:
+        """The open marks anchored to a segment (oldest first) — dismissal targets."""
+        out = []
+        for m in self._open_marks:
+            try:
+                ids = mark_anchor_segments((m.get("payload") or {}).get("anchor") or {})
+            except ValueError:
+                continue
+            if segment_id in ids:
+                out.append(m)
+        return out
+
+    def add_mark_local(self, mark: dict) -> None:
+        """Local echo of a committed mark (the ⚑ paints without a reload)."""
+        self._open_marks.append(mark)
+        self._recompute_marked_ids()
+
+    def dismiss_mark_local(self, mark_id: str) -> None:
+        """Local echo of a mark dismissal."""
+        self._open_marks = [m for m in self._open_marks if m.get("id") != mark_id]
+        self._recompute_marked_ids()
+
     async def close(self) -> None:
         """Tear down the queue + capability stack (app exit)."""
         await self.queue.stop()
@@ -224,3 +273,49 @@ def plan_boundary_shift(
         ltext = left_text.rstrip()
         new_left = f"{ltext} {moved}" if ltext else moved
     return moved, new_left, new_right
+
+
+def parse_mark_input(
+    raw: str,           # The mark-editor submission: `class ["snippet"] [note...]`
+    segment_text: str,  # The focused segment's current effective text (span lookup)
+) -> Optional[Tuple[str, Optional[Tuple[int, int, str]], Optional[str]]]:  # (class, span, note); None = empty input
+    """Parse the M-editor mark grammar (pure; the DEC 2a231843 TUI gesture).
+
+    First token = the mark class (open vocabulary). An optional "double-quoted"
+    snippet that occurs in the segment text becomes a SPAN anchor (first
+    occurrence; offsets + verbatim snapshot). Everything else is the note.
+    A quoted snippet NOT found in the text stays part of the note — the mark
+    degrades to segment scope rather than recording a false span.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    head, _, rest = text.partition(" ")
+    rest = rest.strip()
+    span = None
+    if rest.startswith('"') and '"' in rest[1:]:
+        snippet, _, tail = rest[1:].partition('"')
+        at = segment_text.find(snippet) if snippet else -1
+        if at != -1:
+            span = (at, at + len(snippet), snippet)
+            rest = tail.strip()
+    return head, span, (rest or None)
+
+
+def resolve_mark_class_token(
+    raw: str,         # The mark-editor submission (possibly `N ...`)
+    menu: List[str],  # Selectable classes (recommended slate + observed)
+) -> Tuple[str, Optional[str]]:  # (possibly-rewritten submission, error message or None)
+    """Resolve a leading digit token to its menu class (the M picker; pure).
+
+    `2 "snippet" note` becomes `<menu[1]> "snippet" note` — everything after
+    the digit is preserved VERBATIM (a snippet's inner spacing must survive).
+    Out-of-range numbers return an error instead of minting a numeric class.
+    """
+    head, _, rest = (raw or "").strip().partition(" ")
+    if not head.isdigit():
+        return raw, None
+    n = int(head)
+    if not (1 <= n <= len(menu)):
+        return raw, f"no class #{n} (menu is 1-{len(menu)})"
+    return f"{menu[n - 1]} {rest}".strip(), None
