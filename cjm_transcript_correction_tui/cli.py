@@ -1,4 +1,7 @@
 import argparse
+import os
+
+from cjm_substrate.core.workspace import resolve_workspace
 
 from .app import CorrectionApp
 
@@ -14,8 +17,14 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     p.add_argument("--source", default=None,
                    help="Source node id or title substring (required when the graph "
                         "holds more than one Source)")
-    p.add_argument("--manifests-dir", default=".cjm/manifests",
-                   help="Capability manifests directory")
+    p.add_argument("--manifests-dir", default=None,
+                   help="Capability manifests directory (default: the workspace's "
+                        ".cjm/manifests when one is active, else .cjm/manifests under the cwd)")
+    p.add_argument("--workspace", default=None,
+                   help="Workspace root (5daadfc4; default: CJM_WORKSPACE env, else upward walk "
+                        "from cwd). Supplies the manifests default and is exported so capability "
+                        "workers resolve workspace-scoped paths; run/source DISCOVERY over the "
+                        "workspace graph is the 2ce81638 follow-on")
     p.add_argument("--rendition", default=None,
                    help="AudioRendition selector when a source has more than one "
                         "(\"raw\" or a preprocessing substring); default: auto-select")
@@ -39,6 +48,14 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
 def main() -> int:  # Console-script entry point
     """Parse args, run the correction loop (the app owns the event loop + teardown)."""
     args = build_parser().parse_args()
+    # 5daadfc4 workspace: resolve before anything reads paths; export so
+    # capability workers (ffmpeg etc.) are workspace-scoped.
+    ws = resolve_workspace(explicit=args.workspace)
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
     device = args.audio_device
     if device is not None and device.isdigit():
         device = int(device)
