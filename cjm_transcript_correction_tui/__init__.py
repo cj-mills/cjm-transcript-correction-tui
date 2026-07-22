@@ -5,7 +5,7 @@ this package is authored as graph nodes and projected to `.py`."""
 
 import os
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # PipeWire routing: conda-forge PortAudio ships an ALSA that cannot see the system
 # pipewire/default PCM (hw-only enumeration -> audio lands on the wrong sink, e.g. a

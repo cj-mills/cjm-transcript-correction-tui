@@ -8,7 +8,6 @@ The minimal presentation driver for cjm-transcript-correction-core: a document-o
 
 - **`cjm_transcript_correction_tui.__init__`** — Keyboard-first TUI driver for the transcript-correction workflow — a presentation
 - **`cjm_transcript_correction_tui.app`**
-- **`cjm_transcript_correction_tui.audio`**
 - **`cjm_transcript_correction_tui.cli`**
 - **`cjm_transcript_correction_tui.spine`**
 
@@ -20,12 +19,6 @@ The minimal presentation driver for cjm-transcript-correction-core: a document-o
 - `load_tui_state` _function_ — Read the per-graph TUI sidecar state (last-focused positions).
 - `save_tui_state` _function_ — Merge one source's last-focused position into the sidecar state file.
 
-### `cjm_transcript_correction_tui.audio`
-
-- `ChunkPlayer` _class_ — Persistent-output-stream VAD-chunk player — the focus-walk auto-play engine.
-- `load_chunk` _function_ — Read one VAD chunk's samples from the model-input WAV — frame-sliced, sample-accurate.
-- `stretch` _function_ — Pitch-preserving time-stretch (WSOLA, numpy-only) — the playback-speed engine.
-
 ### `cjm_transcript_correction_tui.cli`
 
 - `build_parser` _function_ — The TUI driver's argument surface (mirrors correction-core's run/review args).
@@ -35,8 +28,14 @@ The minimal presentation driver for cjm-transcript-correction-core: a document-o
 
 - `ChunkRef` _class_ — Where one Segment's VAD-chunk audio lives: the model-input WAV + the chunk-local span.
 - `SpineView` _class_ — One Source's effective correction spine, cursor-windowed for the TUI.
+- `list_sources` _function_ — Enumerate the graph's Source nodes (the discovery corpus, 2ce81638).
+- `match_sources` _function_ — The --source selector (pure; shared by direct open and the picker's seed).
+- `open_stack` _function_ — Bootstrap the graph capability stack, resolving the db path (2ce81638).
+- `parse_mark_input` _function_ — Parse the M-editor mark grammar (pure; the DEC 2a231843 TUI gesture).
 - `plan_boundary_shift` _function_ — Plan a ONE-WORD boundary shift (the [ / ] gesture unit).
+- `resolve_mark_class_token` _function_ — Resolve a leading digit token to its menu class (the M picker; pure).
+- `source_status` _function_ — Correction-status-at-a-glance for one Source (the picker's detail row).
 
 ## Dependencies
 
-**Depends on:** `cjm-context-graph-layer`, `cjm-transcript-correction-core`, `numpy`, `sounddevice`, `soundfile`, `textual`
+**Depends on:** `cjm-context-graph-layer`, `cjm-substrate-tui-kit`, `cjm-transcript-correction-core`, `numpy`, `sounddevice`, `soundfile`, `textual`

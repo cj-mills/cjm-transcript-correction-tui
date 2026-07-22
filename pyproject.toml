@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cjm-transcript-correction-tui"
-version = "0.0.1"
+version = "0.0.2"
 description = "Transcript-correction TUI driver: keyboard-first terminal review surface (cursor-windowed segment walk, VAD-chunk audio auto-play, fidelity + boundary-shift corrections, agents-propose/humans-confirm triage) over cjm-transcript-correction-core's operation vocabulary. The first born-on-graph library of the self-hosting graph arc."
 readme = "README.md"
 requires-python = ">=3.12"
