@@ -16,7 +16,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .spine import parse_mark_input, plan_boundary_shift, resolve_mark_class_token, SpineView
+from .spine import (list_sources, match_sources, open_stack, parse_mark_input, plan_boundary_shift,
+                    resolve_mark_class_token, source_status, SpineView)
 
 
 class CorrectionApp(App):
@@ -70,11 +71,12 @@ class CorrectionApp(App):
         Binding("N", "prev_mark", "prev mark"),
         Binding("p", "next_prune", "next prune"),
         Binding("P", "prev_prune", "prev prune"),
+        Binding("enter", "open_source", "open", show=False),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
     ]
 
-    def __init__(self, graph_db_path: str,                # The shared transcription graph db
+    def __init__(self, graph_db_path: Optional[str] = None,  # The shared transcription graph db (None = workspace-resolved, 2ce81638)
                  *, source: Optional[str] = None,         # Source id or title substring
                  manifests_dir: str = ".cjm/manifests",   # Capability manifests directory
                  rendition: Optional[str] = None,         # Rendition selector (None = auto)
@@ -87,8 +89,16 @@ class CorrectionApp(App):
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition)
         self._graph_db_path = graph_db_path
-        # Every correction write appends through to the db's sidecar journal (DEC ccbab9f5).
-        self._journal_path = sidecar_journal_path(graph_db_path)
+        # Every correction write appends through to the db's sidecar journal (DEC
+        # ccbab9f5); the path derives from the EFFECTIVE db at mount (may be
+        # workspace-resolved, so it cannot be computed here).
+        self._journal_path: Optional[object] = None
+        self.stage = "select"            # "select" (source picker) -> "correct" (the walk)
+        self._graph_cap = "cjm-capability-graph-sqlite"
+        self._manager = None             # the open stack; view.close() owns teardown once a spine opens
+        self._queue = None
+        self._sources: List[Tuple[str, str]] = []     # [(source_id, title)] the picker walks
+        self._status: Dict[str, Dict[str, int]] = {}  # source_id -> status-at-a-glance
         self.view: Optional[SpineView] = None
         self.player: Optional[ChunkPlayer] = None
         self.cursor = 0
@@ -114,8 +124,31 @@ class CorrectionApp(App):
         yield editor
 
     async def on_mount(self) -> None:
-        self.view = await SpineView.open(self._graph_db_path, **self._open_kwargs)
+        self._manager, self._queue, db = await open_stack(
+            self._graph_db_path, manifests_dir=self._open_kwargs["manifests_dir"],
+            graph_capability=self._graph_cap)
+        self._graph_db_path = db
+        self._journal_path = sidecar_journal_path(db)
         self.player = ChunkPlayer(device=self.audio_device)
+        sources = await list_sources(self._queue, self._graph_cap)
+        picked = match_sources(sources, self._open_kwargs["source"])
+        if len(picked) == 1:
+            await self._open_source(*picked[0])
+            return
+        # 2ce81638 discovery: no unique --source -> browse the graph's Sources
+        # (a bad needle widens to ALL of them, never a dead-end error).
+        self._sources = picked if len(picked) > 1 else sources
+        for sid, _ in self._sources:
+            self._status[sid] = await source_status(self._queue, self._graph_cap, sid)
+        self.cursor = 0
+        self._render()
+
+    async def _open_source(self, source_id: str, title: str) -> None:
+        """Open one Source's spine on the already-open stack and enter the walk."""
+        self.view = await SpineView.open_on(self._manager, self._queue, self._graph_cap,
+                                            source_id, title,
+                                            rendition=self._open_kwargs["rendition"])
+        self.stage = "correct"
         sess = await start_session(self.view.queue, self.view.graph_id,
                                    [self.view.source_id],
                                    journal_path=self._journal_path)
@@ -128,6 +161,7 @@ class CorrectionApp(App):
             self.speed = 1.0
         mc = str(state.get("_mark_class") or "suspect")
         self._mark_class = mc if mc[:1].isalnum() else "suspect"   # heal a junk-class sidecar
+        self.cursor = 0                    # the picker borrowed the cursor
         if self.resume:
             saved = state.get(self.view.source_id)
             if saved and self.view.size:
@@ -202,6 +236,9 @@ class CorrectionApp(App):
         is pinned to the vertical center of the card area; neighbor cards stack
         outward from it (one blank separator row) and absorb the height variance,
         clipping at the screen edges. The pin never moves — the spine flows past it."""
+        if self.stage == "select":
+            self._render_picker()
+            return
         view = self.view
         if not view.size:
             self.query_one("#status", Static).update(f"{view.source_title}  ·  empty spine")
@@ -239,6 +276,48 @@ class CorrectionApp(App):
             f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · \\[/] speed · e edit · y copy"
             f" · space/u ±reviewed · m/b/M ⚑mark · n/N⚑ p/P✂ jump · q quit")
 
+    def _render_picker(self) -> None:
+        """The 2ce81638 discovery stage: the graph's Sources with correction
+        status at a glance; same key vocabulary as the walk (j/k, enter opens).
+        Spans only — no base row styles (7aca1117)."""
+        width = max(20, self.size.width)
+        lines: List[Text] = [Text("")]
+        if not self._sources:
+            lines.append(Text("  no Source nodes on this graph", style="dim"))
+        for i, (sid, title) in enumerate(self._sources):
+            st = self._status.get(sid) or {}
+            focused = (i == self.cursor)
+            row = Text("")
+            row.append("  > " if focused else "    ")
+            row.append(title or sid[:12], style="bold" if focused else "")
+            row.append(f"   {st.get('segments', 0)} segs", style="dim")
+            row.append(f" · {st.get('corrections', 0)} corrections", style="dim")
+            marks = st.get("marks", 0)
+            if marks:
+                row.append(f" · {marks} ⚑", style="yellow")
+            row.truncate(width)
+            lines.append(row)
+        self.query_one("#cards", Static).update(Text("\n").join(lines))
+        tail = str(self._graph_db_path or "")
+        tail = tail if len(tail) <= 40 else "…" + tail[-39:]
+        self.query_one("#status", Static).update(
+            f"pick a source ({len(self._sources)})  ·  @{tail}"
+            f"  ·  j/k walk · enter open · q quit")
+
+    def check_action(self, action: str, parameters) -> bool:
+        """Stage gate: during the picker only walk/open/quit act — the whole
+        correction vocabulary stays inert until a spine is open (view-None
+        crash guard, one gate instead of twenty)."""
+        if self.stage == "select":
+            return action in ("next", "prev", "open_source", "quit_app")
+        return True
+
+    async def action_open_source(self) -> None:
+        if self.stage != "select" or not self._sources:
+            return
+        sid, title = self._sources[self.cursor]
+        await self._open_source(sid, title)
+
     def _play_cursor(self) -> None:
         c = self.view.chunk(self.cursor)
         if c is None:
@@ -247,6 +326,11 @@ class CorrectionApp(App):
         self.player.play(load_chunk(c.wav_path, c.start_s, c.end_s, speed=self.speed))
 
     def _move(self, delta: int) -> None:
+        if self.stage == "select":                 # the picker walks the source list
+            if self._sources:
+                self.cursor = max(0, min(len(self._sources) - 1, self.cursor + delta))
+                self._render()
+            return
         new = max(0, min(self.view.size - 1, self.cursor + delta))
         if new == self.cursor:
             return
@@ -607,6 +691,8 @@ class CorrectionApp(App):
             self.player.close()
         if self.view is not None:
             await self.view.close()
+        elif self._queue is not None:
+            await self._queue.stop()   # picker-stage quit: the stack is open, no view owns it yet
         self.exit()
 
 

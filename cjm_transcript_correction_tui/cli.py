@@ -12,19 +12,23 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
         prog="cjm-transcript-correction-tui",
         description="Keyboard-first correction loop over a transcription context graph "
                     "(document-order segment walk, VAD-chunk auto-play, fidelity edits).")
-    p.add_argument("--graph-db-path", required=True,
-                   help="The shared transcription graph db (the committed spine)")
+    p.add_argument("--graph-db-path", default=None,
+                   help="The shared transcription graph db (the committed spine); "
+                        "default: the graph capability's persisted config — under an "
+                        "active workspace the config store is workspace-scoped, so "
+                        "the workspace names the db (2ce81638)")
     p.add_argument("--source", default=None,
-                   help="Source node id or title substring (required when the graph "
-                        "holds more than one Source)")
+                   help="Source node id or title substring; omitted or ambiguous -> "
+                        "the in-TUI source picker (correction status at a glance)")
     p.add_argument("--manifests-dir", default=None,
                    help="Capability manifests directory (default: the workspace's "
                         ".cjm/manifests when one is active, else .cjm/manifests under the cwd)")
     p.add_argument("--workspace", default=None,
                    help="Workspace root (5daadfc4; default: CJM_WORKSPACE env, else upward walk "
                         "from cwd). Supplies the manifests default and is exported so capability "
-                        "workers resolve workspace-scoped paths; run/source DISCOVERY over the "
-                        "workspace graph is the 2ce81638 follow-on")
+                        "workers resolve workspace-scoped paths and the config store "
+                        "supplies the graph db default (2ce81638 discovery is built: "
+                        "no --source -> in-TUI picker)")
     p.add_argument("--rendition", default=None,
                    help="AudioRendition selector when a source has more than one "
                         "(\"raw\" or a preprocessing substring); default: auto-select")

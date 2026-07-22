@@ -112,3 +112,17 @@ def test_resolve_mark_class_token():
     assert raw == "9" and err is not None
     raw, err = resolve_mark_class_token("0 note", menu)
     assert raw == "0 note" and err is not None
+
+
+def test_match_sources_selector_arms():
+    """2ce81638 discovery: the --source selector is pure and shared by direct
+    open and the picker seed — exact-id wins, title substring is case-blind,
+    None selects all, a miss selects none (the app widens a miss to the full
+    picker instead of dead-ending)."""
+    from cjm_transcript_correction_tui.spine import match_sources
+    sources = [("id-a", "Intro꞉ Learning Games"), ("id-b", "Chapter One")]
+    assert match_sources(sources, None) == sources
+    assert match_sources(sources, "id-a") == [sources[0]]
+    assert match_sources(sources, "chapter") == [sources[1]]
+    assert match_sources(sources, "LEARNING") == [sources[0]]
+    assert match_sources(sources, "zzz") == []

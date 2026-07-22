@@ -61,37 +61,43 @@ class SpineView:
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
 
     @classmethod
-    async def open(cls, graph_db_path: str,                 # The shared transcription graph db
+    async def open(cls, graph_db_path: Optional[str],       # The shared transcription graph db (None = workspace-resolved)
                    *, source: Optional[str] = None,         # Source node id OR a title substring
                    manifests_dir: str = ".cjm/manifests",   # Capability manifests directory
                    graph_capability: str = "cjm-capability-graph-sqlite",
                    rendition: Optional[str] = None,         # Rendition selector (None = auto)
                    ) -> "SpineView":
-        """Bootstrap the capability stack and load one Source's effective spine."""
-        manager = CapabilityManager(search_paths=[Path(manifests_dir)])
-        load_capabilities(manager, [graph_capability],
-                          configs={graph_capability: {"db_path": str(graph_db_path)}})
-        queue = JobQueue(deps=manager)
-        await queue.start()
+        """Bootstrap the capability stack and load one Source's effective spine
+        (the direct/scripted launch; the app's picker composes the same rungs —
+        open_stack / list_sources / open_on — around a selection stage)."""
+        manager, queue, _ = await open_stack(graph_db_path, manifests_dir=manifests_dir,
+                                             graph_capability=graph_capability)
         try:
-            sq = NodeQuery(label="Source", project=["title"])
-            res = await graph_task(queue, graph_capability, "query_nodes", query=sq.to_dict())
-            sources = [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])]
-            if source:
-                picked = [(i, t) for i, t in sources
-                          if i == source or source.lower() in t.lower()]
-            else:
-                picked = sources
+            sources = await list_sources(queue, graph_capability)
+            picked = match_sources(sources, source)
             if len(picked) != 1:
                 titles = "; ".join(t for _, t in sources)
                 raise ValueError(f"need exactly one Source (matched {len(picked)}) — "
                                  f"pass `source=` an id or title substring; available: {titles}")
-            view = cls(manager, queue, graph_capability, picked[0][0], picked[0][1])
-            await view._load(rendition)
-            return view
+            return await cls.open_on(manager, queue, graph_capability,
+                                     picked[0][0], picked[0][1], rendition=rendition)
         except BaseException:
             await queue.stop()
             raise
+
+    @classmethod
+    async def open_on(cls, manager: CapabilityManager,      # The open stack's manager
+                      queue: JobQueue,                      # Started queue (teardown stays with the caller until the view owns it)
+                      graph_id: str,                        # The graph capability name
+                      source_id: str,                       # The picked Source node id
+                      source_title: str,                    # Its display title
+                      *, rendition: Optional[str] = None,   # Rendition selector (None = auto)
+                      ) -> "SpineView":
+        """Load one Source's effective spine on an ALREADY-open stack (the
+        picker's open rung — discovery browsed the stack first, 2ce81638)."""
+        view = cls(manager, queue, graph_id, source_id, source_title)
+        await view._load(rendition)
+        return view
 
     async def _load(self, rendition: Optional[str]) -> None:
         """Load spine + corrections + the audio join (one Source, one rendition chain)."""
@@ -319,3 +325,72 @@ def resolve_mark_class_token(
     if not (1 <= n <= len(menu)):
         return raw, f"no class #{n} (menu is 1-{len(menu)})"
     return f"{menu[n - 1]} {rest}".strip(), None
+
+
+async def open_stack(
+    graph_db_path: Optional[str],            # Explicit graph db, or None = the workspace answers
+    *, manifests_dir: str = ".cjm/manifests",  # Capability manifests directory
+    graph_capability: str = "cjm-capability-graph-sqlite",
+) -> Tuple[CapabilityManager, JobQueue, str]:  # (manager, started queue, effective db path)
+    """Bootstrap the graph capability stack, resolving the db path (2ce81638).
+
+    With an explicit path the capability loads against it (today's hand-carried
+    launch). With None, the capability loads on its PERSISTED config — under
+    CJM_WORKSPACE the substrate config store is workspace-scoped (5daadfc4), so
+    the workspace itself names the graph db; the effective path reads back off
+    the loaded instance (CR-2 applies persisted config when the caller sends
+    none). No db path anywhere = loud refusal naming both outs."""
+    manager = CapabilityManager(search_paths=[Path(manifests_dir)])
+    configs = ({graph_capability: {"db_path": str(graph_db_path)}}
+               if graph_db_path else None)
+    load_capabilities(manager, [graph_capability], configs=configs)
+    effective = graph_db_path or (
+        (manager.instances[graph_capability].config or {}).get("db_path"))
+    if not effective:
+        raise ValueError(
+            f"no graph db path: pass --graph-db-path, or persist one on "
+            f"{graph_capability} in the active workspace's config store")
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    return manager, queue, str(effective)
+
+
+async def list_sources(
+    queue: JobQueue,      # Started queue over the loaded graph capability
+    graph_id: str,        # The graph capability name
+) -> List[Tuple[str, str]]:  # [(source_id, title)] in query order
+    """Enumerate the graph's Source nodes (the discovery corpus, 2ce81638)."""
+    sq = NodeQuery(label="Source", project=["title"])
+    res = await graph_task(queue, graph_id, "query_nodes", query=sq.to_dict())
+    return [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])]
+
+
+def match_sources(
+    sources: List[Tuple[str, str]],  # [(source_id, title)] as enumerated
+    needle: Optional[str],           # Source node id OR a title substring; None = all
+) -> List[Tuple[str, str]]:  # The subset the needle selects (all when None)
+    """The --source selector (pure; shared by direct open and the picker's seed)."""
+    if not needle:
+        return list(sources)
+    return [(i, t) for i, t in sources
+            if i == needle or needle.lower() in t.lower()]
+
+
+async def source_status(
+    queue: JobQueue,      # Started queue over the loaded graph capability
+    graph_id: str,        # The graph capability name
+    source_id: str,       # Source whose correction status to summarize
+) -> Dict[str, int]:  # {"segments": VAD-chunk count, "corrections": active, "marks": open}
+    """Correction-status-at-a-glance for one Source (the picker's detail row).
+
+    Segments count the VAD skeleton (AudioSegment PART_OF source — the same
+    full-skeleton walk the correction surface presents); corrections count the
+    ACTIVE set (supersession applied), marks the OPEN ⚑ set."""
+    aq = NodeQuery(label=TranscriptGraphLabels.AUDIO_SEGMENT,
+                   related=RelationPredicate(SpineRelations.PART_OF, node_id=source_id),
+                   project=["id"])
+    ares = await graph_task(queue, graph_id, "query_nodes", query=aq.to_dict())
+    corrections, superseded = await load_source_corrections(queue, graph_id, source_id)
+    return {"segments": len(ares.rows or []),
+            "corrections": len(active_corrections(corrections, superseded)),
+            "marks": len(open_marks(corrections, superseded))}
