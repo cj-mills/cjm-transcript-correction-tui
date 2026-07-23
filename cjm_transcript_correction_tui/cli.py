@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     p.add_argument("--rendition", default=None,
                    help="AudioRendition selector when a source has more than one "
                         "(\"raw\" or a preprocessing substring); default: auto-select")
+    p.add_argument("--skeleton", default=None,
+                   help="Skeleton-spine selector when several coexist under one rendition "
+                        "(sentence-split, DEC f1024568): \"legacy\" or a skeleton-hash prefix; "
+                        "default: the in-TUI spine picker (choice persists in the sidecar)")
     p.add_argument("--actor", default="human",
                    help="Actor recorded on corrections + review markers")
     p.add_argument("--no-autoplay", action="store_true",
@@ -65,6 +69,7 @@ def main() -> int:  # Console-script entry point
         device = int(device)
     app = CorrectionApp(args.graph_db_path, source=args.source,
                         manifests_dir=args.manifests_dir, rendition=args.rendition,
+                        skeleton=args.skeleton,
                         actor=args.actor, autoplay=not args.no_autoplay,
                         audio_device=device, resume=not args.no_resume,
                         shift_floor_s=args.shift_floor_ms / 1000.0)

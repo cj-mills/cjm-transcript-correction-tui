@@ -66,6 +66,7 @@ class SpineView:
                    manifests_dir: str = ".cjm/manifests",   # Capability manifests directory
                    graph_capability: str = "cjm-capability-graph-sqlite",
                    rendition: Optional[str] = None,         # Rendition selector (None = auto)
+                   skeleton: Optional[str] = None,          # Skeleton-spine selector ("legacy" | hash; None = auto)
                    ) -> "SpineView":
         """Bootstrap the capability stack and load one Source's effective spine
         (the direct/scripted launch; the app's picker composes the same rungs —
@@ -80,7 +81,8 @@ class SpineView:
                 raise ValueError(f"need exactly one Source (matched {len(picked)}) — "
                                  f"pass `source=` an id or title substring; available: {titles}")
             return await cls.open_on(manager, queue, graph_capability,
-                                     picked[0][0], picked[0][1], rendition=rendition)
+                                     picked[0][0], picked[0][1], rendition=rendition,
+                                     skeleton=skeleton)
         except BaseException:
             await queue.stop()
             raise
@@ -92,17 +94,21 @@ class SpineView:
                       source_id: str,                       # The picked Source node id
                       source_title: str,                    # Its display title
                       *, rendition: Optional[str] = None,   # Rendition selector (None = auto)
+                      skeleton: Optional[str] = None,       # Skeleton-spine selector ("legacy" | hash; None = auto, refuses when >1 coexist)
                       ) -> "SpineView":
         """Load one Source's effective spine on an ALREADY-open stack (the
         picker's open rung — discovery browsed the stack first, 2ce81638)."""
         view = cls(manager, queue, graph_id, source_id, source_title)
-        await view._load(rendition)
+        await view._load(rendition, skeleton)
         return view
 
-    async def _load(self, rendition: Optional[str]) -> None:
-        """Load spine + corrections + the audio join (one Source, one rendition chain)."""
+    async def _load(self, rendition: Optional[str],
+                    skeleton: Optional[str] = None) -> None:
+        """Load spine + corrections + the audio join (one Source, one rendition
+        chain, one SKELETON spine — coexisting spines never mix, DEC f1024568)."""
         segments = await load_source_segments(self.queue, self.graph_id, self.source_id,
-                                              rendition_selector=rendition)
+                                              rendition_selector=rendition,
+                                              skeleton_selector=skeleton)
         corrections, superseded = await load_source_corrections(
             self.queue, self.graph_id, self.source_id)
         active = active_corrections(corrections, superseded)

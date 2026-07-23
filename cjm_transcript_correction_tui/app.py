@@ -9,6 +9,7 @@ from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_mark_correction, commit_mark_dismissal,
                                                   commit_prune_amendment, commit_text_correction,
+                                                  LEGACY_SKELETON, list_source_spines,
                                                   record_review_markers, start_session)
 from cjm_transcript_correction_core.models import RECOMMENDED_MARK_CLASSES
 from rich.text import Text
@@ -80,6 +81,7 @@ class CorrectionApp(App):
                  *, source: Optional[str] = None,         # Source id or title substring
                  manifests_dir: str = ".cjm/manifests",   # Capability manifests directory
                  rendition: Optional[str] = None,         # Rendition selector (None = auto)
+                 skeleton: Optional[str] = None,          # Skeleton-spine selector ("legacy" | hash prefix; None = picker/sidecar decides)
                  actor: str = "human",                    # Actor recorded on corrections
                  autoplay: bool = True,                   # Auto-play the focused chunk
                  audio_device: Optional[object] = None,   # Output device (None = system default)
@@ -87,7 +89,9 @@ class CorrectionApp(App):
                  shift_floor_s: float = 0.0):             # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
-                                 rendition=rendition)
+                                 rendition=rendition, skeleton=skeleton)
+        self._spines: List[Dict[str, Any]] = []      # coexisting skeleton spines of the source being opened
+        self._spine_source: Optional[Tuple[str, str]] = None  # (source_id, title) awaiting a spine choice
         self._graph_db_path = graph_db_path
         # Every correction write appends through to the db's sidecar journal (DEC
         # ccbab9f5); the path derives from the EFFECTIVE db at mount (may be
@@ -144,10 +148,35 @@ class CorrectionApp(App):
         self._render()
 
     async def _open_source(self, source_id: str, title: str) -> None:
-        """Open one Source's spine on the already-open stack and enter the walk."""
+        """Open one Source: resolve WHICH skeleton spine first (DEC f1024568).
+
+        One spine (or an explicit --skeleton) opens directly. Coexisting spines
+        ALWAYS show the picker — the sidecar choice pre-positions the cursor on
+        the last-opened spine rather than auto-opening it (user 2026-07-22:
+        memory = position, not a bypass; switching spines must stay one glance
+        away)."""
+        selector = self._open_kwargs["skeleton"]
+        spines = await list_source_spines(self._queue, self._graph_cap, source_id,
+                                          rendition_selector=self._open_kwargs["rendition"])
+        if selector is None and len(spines) > 1:
+            saved = load_tui_state(self._graph_db_path).get(source_id) or {}
+            last = str(saved.get("skeleton") or "")
+            self._spines = spines
+            self._spine_source = (source_id, title)
+            self.stage = "spine"
+            self.cursor = next((i for i, sp in enumerate(spines)
+                                if selector_for_spine(sp) == last), 0)
+            self._render()
+            return
+        await self._open_spine(source_id, title, selector)
+
+    async def _open_spine(self, source_id: str, title: str,
+                          skeleton: Optional[str]) -> None:
+        """Open one Source's CHOSEN spine on the already-open stack and enter the walk."""
         self.view = await SpineView.open_on(self._manager, self._queue, self._graph_cap,
                                             source_id, title,
-                                            rendition=self._open_kwargs["rendition"])
+                                            rendition=self._open_kwargs["rendition"],
+                                            skeleton=skeleton)
         self.stage = "correct"
         sess = await start_session(self.view.queue, self.view.graph_id,
                                    [self.view.source_id],
@@ -239,6 +268,9 @@ class CorrectionApp(App):
         if self.stage == "select":
             self._render_picker()
             return
+        if self.stage == "spine":
+            self._render_spine_picker()
+            return
         view = self.view
         if not view.size:
             self.query_one("#status", Static).update(f"{view.source_title}  ·  empty spine")
@@ -304,15 +336,53 @@ class CorrectionApp(App):
             f"pick a source ({len(self._sources)})  ·  @{tail}"
             f"  ·  j/k walk · enter open · q quit")
 
+    def _render_spine_picker(self) -> None:
+        """The spine picker (DEC f1024568): one row per coexisting SKELETON —
+        config summary + segment count — when a source carries more than one
+        (e.g. the pre-split spine beside a sentence-split re-decomposition).
+        Always shown for multi-spine sources; the sidecar choice pre-positions
+        the cursor on the last-opened spine. Spans only — no base row styles
+        (7aca1117)."""
+        width = max(20, self.size.width)
+        _, title = self._spine_source or ("", "")
+        lines: List[Text] = [Text("")]
+        header = Text("  ")
+        header.append(title or "source", style="bold")
+        header.append(f"  ·  {len(self._spines)} spines coexist — pick one", style="dim")
+        lines.append(header)
+        lines.append(Text(""))
+        for i, sp in enumerate(self._spines):
+            focused = (i == self.cursor)
+            row = Text("")
+            row.append("  > " if focused else "    ")
+            row.append(spine_label(sp), style="bold" if focused else "")
+            row.append(f"   {sp.get('segments', 0)} segs", style="dim")
+            row.truncate(width)
+            lines.append(row)
+        self.query_one("#cards", Static).update(Text("\n").join(lines))
+        self.query_one("#status", Static).update(
+            "pick a spine  ·  j/k walk · enter open (choice persists) · q quit")
+
     def check_action(self, action: str, parameters) -> bool:
         """Stage gate: during the picker only walk/open/quit act — the whole
         correction vocabulary stays inert until a spine is open (view-None
         crash guard, one gate instead of twenty)."""
-        if self.stage == "select":
+        if self.stage in ("select", "spine"):
             return action in ("next", "prev", "open_source", "quit_app")
         return True
 
     async def action_open_source(self) -> None:
+        if self.stage == "spine":
+            if not self._spines or self._spine_source is None:
+                return
+            sid, title = self._spine_source
+            selector = selector_for_spine(self._spines[self.cursor])
+            # Persist the choice: it pre-positions the picker cursor next open
+            # (the menu itself always shows — user 2026-07-22).
+            save_tui_state(self._graph_db_path, sid, None,
+                           skeleton=selector, spines=len(self._spines))
+            await self._open_spine(sid, title, selector)
+            return
         if self.stage != "select" or not self._sources:
             return
         sid, title = self._sources[self.cursor]
@@ -329,6 +399,11 @@ class CorrectionApp(App):
         if self.stage == "select":                 # the picker walks the source list
             if self._sources:
                 self.cursor = max(0, min(len(self._sources) - 1, self.cursor + delta))
+                self._render()
+            return
+        if self.stage == "spine":                  # the spine picker walks the skeletons
+            if self._spines:
+                self.cursor = max(0, min(len(self._spines) - 1, self.cursor + delta))
                 self._render()
             return
         new = max(0, min(self.view.size - 1, self.cursor + delta))
@@ -706,21 +781,56 @@ def load_tui_state(
 def save_tui_state(
     graph_db_path: str,  # The graph db whose sidecar state file to write
     source_id: str,      # Source whose position is being remembered
-    cursor: int,         # Last-focused segment position
+    cursor: Optional[int],  # Last-focused segment position (None = leave as-is)
     speed: Optional[float] = None,  # Playback-rate preference (db-wide `_speed`; None = leave as-is)
     mark_class: Optional[str] = None,  # Last-used ⚑ class (db-wide `_mark_class`; None = leave as-is)
+    skeleton: Optional[str] = None,  # Chosen skeleton-spine selector (per-source; None = leave as-is)
+    spines: Optional[int] = None,    # Spine-set size the choice was made against (re-prompt key)
 ) -> None:
-    """Merge one source's last-focused position into the sidecar state file.
+    """Merge one source's view state into the sidecar state file.
 
     VIEW state, not knowledge — it lives in a local sidecar next to the db,
-    never as a graph write (the cursor is where the eye was, not a decision).
-    Write failures are silently tolerated: losing a bookmark must never break
-    the correction loop."""
+    never as a graph write (the cursor is where the eye was, not a decision;
+    the spine CHOICE is a view preference too — the graph-asserted active
+    spine stays deferred per DEC f1024568). Per-source entries MERGE so a
+    cursor write never drops the spine choice and vice versa. Write failures
+    are silently tolerated: losing a bookmark must never break the loop."""
     store = SidecarState(f"{graph_db_path}.tui-state.json")
     state = store.load()
-    state[source_id] = {"cursor": int(cursor), "ts": time.time()}
+    entry = dict(state.get(source_id) or {})
+    if cursor is not None:
+        entry["cursor"] = int(cursor)
+    entry["ts"] = time.time()
+    if skeleton is not None:
+        entry["skeleton"] = str(skeleton)
+    if spines is not None:
+        entry["spines"] = int(spines)
+    state[source_id] = entry
     if speed is not None:
         state["_speed"] = float(speed)
     if mark_class is not None:
         state["_mark_class"] = str(mark_class)
     store.write(state)
+
+
+def spine_label(
+    spine: Dict[str, Any],  # One list_source_spines row
+) -> str:  # Picker-row config summary
+    """One picker row's config summary for a skeleton spine (pure).
+
+    Legacy (no skeleton_hash) reads as the incumbent VAD-only spine; split
+    spines show their policy tag + a hash prefix (the persisted selector value
+    stays the FULL hash — see selector_for_spine)."""
+    h = spine.get("skeleton_hash")
+    if not h:
+        return "vad-only (pre-split)"
+    tag = spine.get("split_policy") or "vad-only"
+    return f"{tag} · {str(h).split(':')[-1][:8]}"
+
+
+def selector_for_spine(
+    spine: Dict[str, Any],  # One list_source_spines row
+) -> str:  # The --skeleton selector naming this spine
+    """The selector value a picker choice persists (pure): the full skeleton
+    hash, or the LEGACY_SKELETON token for the pre-split spine."""
+    return str(spine.get("skeleton_hash") or LEGACY_SKELETON)
