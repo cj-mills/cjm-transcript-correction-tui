@@ -60,6 +60,8 @@ class SpineView:
         self._open_marks: List[dict] = []            # OPEN mark Corrections (routed attention)
         self.marked_ids: set = set()                 # Segment ids an open mark anchors (⚑ glyphs)
         self.seen_mark_classes: List[str] = []       # DISTINCT classes journaled on this source (open or discharged)
+        self.inserted_ids: set = set()               # Synthetic chunk-insert segment ids (⊕ paint + gesture routing)
+        self.insert_labels: Dict[str, Optional[str]] = {}  # insert id -> annotation label
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
         self.source_path: Optional[str] = None       # Original source media path (Source.path; the g/G seam decode target)
@@ -138,6 +140,14 @@ class SpineView:
         prune_ids = {c.get("id") for c in self._prune_corrections}
         projected = [c for c in active if c.get("id") not in prune_ids]
         self.segments = project_effective_spine(segments, projected)
+        # Synthetic (inserted) chunks: id = the insertion Correction's node id
+        # (DEC 3d3fa2a8) — tracked for ⊕ paint, gesture routing, and the
+        # source-slice playback path (no model-input WAV need cover them).
+        ins = [c for c in active
+               if c.get("correction_type") == "insertion"
+               and (c.get("payload") or {}).get("operation") == "chunk_insert"]
+        self.inserted_ids = {c["id"] for c in ins}
+        self.insert_labels = {c["id"]: (c.get("payload") or {}).get("label") for c in ins}
         rend_ids = set(await resolve_source_renditions(
             self.queue, self.graph_id, self.source_id, rendition))
         aq = NodeQuery(label=TranscriptGraphLabels.AUDIO_SEGMENT,
@@ -281,6 +291,34 @@ class SpineView:
         """Local echo of a mark dismissal."""
         self._open_marks = [m for m in self._open_marks if m.get("id") != mark_id]
         self._recompute_marked_ids()
+
+    def add_insert_local(self, corr: dict) -> Optional[int]:
+        """Local echo of a committed chunk insertion: splice the synthetic
+        segment after its left flank (the projection's placement) and return
+        its walk position; None = flank not in this spine (echo refused)."""
+        p = corr.get("payload") or {}
+        pos = next((i for i, s in enumerate(self.segments)
+                    if s.id == p.get("after_segment_id")), None)
+        if pos is None:
+            return None
+        seg = SpineSegment(
+            id=corr["id"], index=self.segments[pos].index,
+            text=str(p.get("text") or ""),
+            start_time=p.get("start_time"), end_time=p.get("end_time"))
+        self.segments.insert(pos + 1, seg)
+        self.inserted_ids.add(corr["id"])
+        self.insert_labels[corr["id"]] = p.get("label")
+        return pos + 1
+
+    def remove_insert_local(self, insert_id: str) -> Optional[int]:
+        """Local echo of a chunk-insert removal; returns the vacated position."""
+        pos = next((i for i, s in enumerate(self.segments) if s.id == insert_id), None)
+        if pos is None:
+            return None
+        del self.segments[pos]
+        self.inserted_ids.discard(insert_id)
+        self.insert_labels.pop(insert_id, None)
+        return pos
 
     async def close(self) -> None:
         """Tear down the queue + capability stack (app exit)."""
@@ -542,3 +580,41 @@ def plan_time_nudge(
     else:
         return None
     return edits
+
+
+def plan_chunk_insert(
+    segments: List,          # The walked spine (SpineSegment-shaped: id/start_time/end_time)
+    index: int,              # Cursor position (the insert lands in the gap AFTER it)
+    weld_eps: float = 0.01,  # Point-cut weld threshold (seconds)
+) -> Optional[Dict[str, Any]]:  # {"after_id","before_id","start_s","end_s","welded"}; None = refused
+    """Plan a chunk insertion into the gap after the cursor (the i gesture unit; pure).
+
+    Whole-gap by default — the de994164 missed-dispatch case is one keystroke.
+    At a WELDED point cut (gap within weld_eps — sentence cuts share the exact
+    boundary) the insert is born ZERO-WIDTH at the cut; the existing nudge keys
+    grow it over the bookends (insert+nudge completes non-speech isolation with
+    no new machinery, DEC 3d3fa2a8). At the spine tail (no right neighbor) it
+    is also born zero-width at the last segment's end. Refusals (None): cursor
+    off the spine, missing audio times, or an OVERLAPPING boundary (negative
+    gap beyond the weld eps — hear it with g and nudge the overlap first).
+    """
+    if not (0 <= index < len(segments)):
+        return None
+    left = segments[index]
+    if left.start_time is None or left.end_time is None:
+        return None
+    l_end = float(left.end_time)
+    right = segments[index + 1] if index + 1 < len(segments) else None
+    if right is None:
+        return {"after_id": left.id, "before_id": None,
+                "start_s": l_end, "end_s": l_end, "welded": True}
+    if right.start_time is None or right.end_time is None:
+        return None
+    gap = float(right.start_time) - l_end
+    if gap < -weld_eps:
+        return None
+    if gap < weld_eps:
+        return {"after_id": left.id, "before_id": right.id,
+                "start_s": l_end, "end_s": l_end, "welded": True}
+    return {"after_id": left.id, "before_id": right.id,
+            "start_s": l_end, "end_s": float(right.start_time), "welded": False}

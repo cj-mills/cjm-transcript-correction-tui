@@ -235,3 +235,76 @@ def test_plan_time_nudge_welds_and_refusals():
     assert plan_time_nudge(welded, 5, "end", 0.1) is None
     # start of the spine cannot go negative
     assert plan_time_nudge([seg("a", 0.0, 5.0)], 0, "start", -0.1) is None
+
+
+def test_plan_chunk_insert_gap_weld_tail_refusals():
+    """DEC 3d3fa2a8 gesture unit: whole-gap insert by default (the de994164
+    missed-dispatch case is one keystroke), ZERO-WIDTH at welded cuts and at
+    the spine tail (grown by the nudge keys), refusals for overlaps beyond the
+    weld eps and missing times."""
+    from types import SimpleNamespace
+
+    from cjm_transcript_correction_tui.spine import plan_chunk_insert
+
+    def seg(sid, start, end):
+        return SimpleNamespace(id=sid, start_time=start, end_time=end)
+
+    # real gap: the whole span, one keystroke
+    gapped = [seg("a", 0.0, 4.5), seg("b", 6.0, 9.0)]
+    plan = plan_chunk_insert(gapped, 0)
+    assert plan == {"after_id": "a", "before_id": "b",
+                    "start_s": 4.5, "end_s": 6.0, "welded": False}
+
+    # welded point cut: zero-width at the cut, nudges grow it over the bookends
+    welded = [seg("a", 0.0, 5.0), seg("b", 5.0, 9.0)]
+    plan = plan_chunk_insert(welded, 0)
+    assert plan["welded"] and plan["start_s"] == plan["end_s"] == 5.0
+    assert plan["after_id"] == "a" and plan["before_id"] == "b"
+
+    # spine tail: zero-width after the last segment, no right flank
+    plan = plan_chunk_insert(gapped, 1)
+    assert plan == {"after_id": "b", "before_id": None,
+                    "start_s": 9.0, "end_s": 9.0, "welded": True}
+
+    # overlap beyond the weld eps: refuse (nudge the overlap first)
+    overlap = [seg("a", 0.0, 5.2), seg("b", 5.0, 9.0)]
+    assert plan_chunk_insert(overlap, 0) is None
+    # missing times / out of range
+    assert plan_chunk_insert([seg("a", None, None), seg("b", 5.0, 9.0)], 0) is None
+    assert plan_chunk_insert([seg("a", 0.0, 4.5), seg("b", None, None)], 0) is None
+    assert plan_chunk_insert(gapped, 5) is None
+
+
+def test_spineview_insert_echo_bookkeeping():
+    """Local echo of chunk insertion/removal (hermetic, no graph stack): the
+    synthetic segment splices after its flank with the flank's layer-0 index,
+    inserted_ids/insert_labels track it, and removal vacates the position."""
+    from cjm_transcript_correction_core.models import SpineSegment
+
+    view = SpineView.__new__(SpineView)
+    view.segments = [SpineSegment(id="a", index=0, text="one",
+                                  start_time=0.0, end_time=4.5),
+                     SpineSegment(id="b", index=1, text="two",
+                                  start_time=6.0, end_time=9.0)]
+    view.inserted_ids = set()
+    view.insert_labels = {}
+
+    pos = view.add_insert_local(
+        {"id": "ins1", "payload": {"operation": "chunk_insert",
+                                   "after_segment_id": "a", "start_time": 4.5,
+                                   "end_time": 6.0, "label": "inhale", "text": ""}})
+    assert pos == 1
+    assert [s.id for s in view.segments] == ["a", "ins1", "b"]
+    assert view.segments[1].index == 0 and view.segments[1].text == ""
+    assert view.inserted_ids == {"ins1"}
+    assert view.insert_labels["ins1"] == "inhale"
+
+    # a foreign flank refuses the echo (the reload will place it, or drop it)
+    assert view.add_insert_local(
+        {"id": "ins2", "payload": {"operation": "chunk_insert",
+                                   "after_segment_id": "zz"}}) is None
+
+    assert view.remove_insert_local("ins1") == 1
+    assert [s.id for s in view.segments] == ["a", "b"]
+    assert view.inserted_ids == set() and view.insert_labels == {}
+    assert view.remove_insert_local("ins1") is None

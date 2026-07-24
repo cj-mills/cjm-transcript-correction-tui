@@ -8,6 +8,8 @@ from cjm_context_graph_layer.journal import sidecar_journal_path
 from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk, stretch
 from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
+                                                  commit_chunk_insert_correction,
+                                                  commit_chunk_insert_removal,
                                                   commit_mark_correction, commit_mark_dismissal,
                                                   commit_prune_amendment, commit_text_correction,
                                                   commit_time_nudge_correction, LEGACY_SKELETON,
@@ -20,8 +22,8 @@ from textual.binding import Binding
 from textual.widgets import Input, Static
 
 from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_mark_input,
-                    plan_boundary_shift, plan_time_nudge, resolve_mark_class_token, source_status,
-                    SpineView)
+                    plan_boundary_shift, plan_chunk_insert, plan_time_nudge,
+                    resolve_mark_class_token, source_status, SpineView)
 
 
 class CorrectionApp(App):
@@ -72,6 +74,9 @@ class CorrectionApp(App):
         Binding("right_curly_bracket", "nudge_step_up", "step +", show=False, key_display="}"),
         Binding("left_square_bracket", "speed_down", "slower", key_display="["),
         Binding("right_square_bracket", "speed_up", "faster", key_display="]"),
+        Binding("i", "insert_chunk", "insert chunk"),
+        Binding("I", "insert_labeled", "insert+label", show=False),
+        Binding("x", "remove_insert", "remove insert", show=False),
         Binding("e", "edit", "edit text"),
         Binding("y", "yank", "copy text"),
         Binding("right", "shift_push", "push word", key_display="→"),
@@ -129,6 +134,7 @@ class CorrectionApp(App):
         self.session_id: Optional[str] = None
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._mark_class = "suspect"       # last-used ⚑ class (m/b repeat it; sidecar-persisted)
+        self._insert_label = "inhale"      # last-used ⊕ insert label (I pre-fills it; sidecar-persisted)
         self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark")
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
@@ -218,6 +224,8 @@ class CorrectionApp(App):
         self._nudge_step = step_ms / 1000.0
         mc = str(state.get("_mark_class") or "suspect")
         self._mark_class = mc if mc[:1].isalnum() else "suspect"   # heal a junk-class sidecar
+        il = str(state.get("_insert_label") or "inhale")
+        self._insert_label = il if il[:1].isalnum() else "inhale"
         self.cursor = 0                    # the picker borrowed the cursor
         if self.resume:
             saved = state.get(self.view.source_id)
@@ -249,7 +257,12 @@ class CorrectionApp(App):
         # appended onto these same row objects, and a base style would bleed
         # into it (the round-2 drive regression — first two lane lines dimmed).
         g1 = Text()
-        g1.append(f"#{seg.index} {mark}", style="dim")
+        if seg.id in view.inserted_ids:
+            # A synthetic (inserted) chunk: no layer-0 index of its own — the ⊕
+            # + flank index reads as "grafted after #N" (DEC 3d3fa2a8).
+            g1.append(f"⊕{seg.index} {mark}", style="cyan")
+        else:
+            g1.append(f"#{seg.index} {mark}", style="dim")
         if seg.id in view.pruned_ids:
             g1.append(" ✂", style="red")
         if seg.id in view.marked_ids:
@@ -257,7 +270,13 @@ class CorrectionApp(App):
         g2 = Text()
         g2.append(f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
                   if seg.start_time is not None else "(no audio)", style="dim")
-        body = Text(seg.text) if seg.text else Text("(empty)", style="dim")
+        if seg.text:
+            body = Text(seg.text)
+        elif seg.id in view.inserted_ids:
+            lab = view.insert_labels.get(seg.id)
+            body = Text(f"(inserted{': ' + lab if lab else ''})", style="cyan")
+        else:
+            body = Text("(empty)", style="dim")
         if abs(pos - self.cursor) > 1 and seg.text:
             body.stylize("dim")
         lane = body.wrap(self.console, lane_w)
@@ -334,7 +353,7 @@ class CorrectionApp(App):
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
             f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge · {{}} step · \\[/] speed · e edit · y copy"
-            f" · space/u ±reviewed · m/b/M ⚑mark · n/N⚑ p/P✂ jump · q quit")
+            f" · i/I ⊕insert · x ⊖remove · space/u ±reviewed · m/b/M ⚑mark · n/N⚑ p/P✂ jump · q quit")
 
     def _render_picker(self) -> None:
         """The 2ce81638 discovery stage: the graph's Sources with correction
@@ -417,6 +436,17 @@ class CorrectionApp(App):
         await self._open_source(sid, title)
 
     def _play_cursor(self) -> None:
+        seg = self.view.segments[self.cursor]
+        if seg.id in self.view.inserted_ids:
+            # Synthetic chunk: its audio may exist ONLY in the original source
+            # (inter-chunk gaps by construction) — decode a source slice, the
+            # seam-audition path. Zero/near-zero width has nothing to sound.
+            self.player.stop()
+            if seg.start_time is not None and seg.end_time is not None \
+                    and float(seg.end_time) - float(seg.start_time) >= 0.02:
+                self.run_worker(self._play_source_span(float(seg.start_time),
+                                                       float(seg.end_time)))
+            return
         c = self.view.chunk(self.cursor)
         if c is None:
             self.player.stop()
@@ -589,7 +619,9 @@ class CorrectionApp(App):
         # g/G manually for cross-boundary context). END nudges replay only the
         # segment TAIL — a long segment must not make the ear wait to reach
         # the edge under judgment (second drive refinement).
-        if edge == "end":
+        if segs[i].id in self.view.inserted_ids:
+            self._play_cursor()   # synthetic chunk: the source-slice playback path
+        elif edge == "end":
             c = self.view.chunk(i)
             if c is None:
                 self.player.stop()
@@ -660,6 +692,9 @@ class CorrectionApp(App):
         if self._input_mode == "mark":
             await self._submit_mark(event.value)
             return
+        if self._input_mode == "insert":
+            await self._submit_insert(event.value)
+            return
         seg = self.view.segments[self.cursor]
         new_text = event.value
         if new_text != seg.text:
@@ -717,6 +752,140 @@ class CorrectionApp(App):
                 else " (corrections stay — supersede via re-edit / opposite shift)")
         self.query_one("#status", Static).update(f"un-reviewed #{seg.index}{note}")
 
+    async def action_insert_chunk(self) -> None:
+        """i: insert a chunk into the gap AFTER the cursor (DEC 3d3fa2a8) —
+        whole-gap span, one keystroke (the de994164 missed-dispatch case);
+        ZERO-WIDTH at a welded cut, grown over the bookends by the nudge keys
+        (insert+nudge completes non-speech isolation with no new machinery)."""
+        await self._insert_chunk(None)
+
+    def action_insert_labeled(self) -> None:
+        """I: labeled insert — the annotation-class editor (open vocabulary,
+        pre-filled with the last-used label): inhale/um/throat-clear bookends
+        become LABELED spans, the VAD-gold flywheel record."""
+        if self._plan_insert() is None:
+            return
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "insert"
+        editor.value = f"{self._insert_label} "
+        editor.display = True
+        editor.focus()
+        self.query_one("#status", Static).update(
+            "insert label (open vocabulary, e.g. inhale · um · throat-clear) · esc cancels")
+
+    def _plan_insert(self) -> Optional[Dict[str, Any]]:
+        """Plan the insert after the cursor; every refusal paints status (None)."""
+        view, i = self.view, self.cursor
+        status = self.query_one("#status", Static)
+        if view.segments[i].id in view.inserted_ids:
+            status.update("insert: cursor is already an inserted chunk — nudge its edges instead")
+            return None
+        nxt = view.segments[i + 1] if i + 1 < view.size else None
+        if nxt is not None and nxt.id in view.inserted_ids:
+            status.update("insert: an inserted chunk already fills this gap — nudge its edges")
+            return None
+        plan = plan_chunk_insert(view.segments, i)
+        if plan is None:
+            status.update("insert: refused (missing times, or an overlapping "
+                          "boundary — nudge the overlap first)")
+            return None
+        return plan
+
+    async def _insert_chunk(self, label: Optional[str]) -> None:
+        """Commit one chunk insertion + local echo; the cursor lands ON the new
+        chunk so nudges/edit/label apply at once."""
+        plan = self._plan_insert()
+        if plan is None:
+            self._render()
+            return
+        view = self.view
+        insert_id = await commit_chunk_insert_correction(
+            view.queue, view.graph_id, view.source_id,
+            plan["after_id"], plan["start_s"], plan["end_s"], self.session_id,
+            before_segment_id=plan["before_id"], label=label,
+            actor=self.actor, journal_path=self._journal_path)
+        pos = view.add_insert_local(
+            {"id": insert_id,
+             "payload": {"operation": "chunk_insert",
+                         "after_segment_id": plan["after_id"],
+                         "start_time": plan["start_s"], "end_time": plan["end_s"],
+                         "label": label, "text": ""}})
+        if pos is not None:
+            # _marks is POSITIONAL (cursor -> decision echo): positions at/after
+            # the splice shift right — the walk-indexing perturbation the design
+            # priced in (DEC 3d3fa2a8 known cost).
+            self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
+            self.cursor = pos
+        self._render()
+        lab = f" [{label}]" if label else ""
+        status = self.query_one("#status", Static)
+        if plan["welded"]:
+            status.update(f"⊕ zero-width insert{lab} at {plan['start_s']:.2f}s"
+                          " — grow it with ,/. </>")
+        else:
+            status.update(f"⊕ inserted{lab} {plan['start_s']:.2f}–{plan['end_s']:.2f}s"
+                          " · playing source · e types its text")
+            self.player.stop()
+            self.run_worker(self._play_source_span(plan["start_s"], plan["end_s"]))
+
+    async def _submit_insert(self, raw: str) -> None:
+        """The I-editor submission: first token = the annotation class."""
+        self._close_editor()
+        tokens = (raw or "").split()
+        if not tokens:
+            self._render()
+            return
+        label = tokens[0].strip('`"\'')
+        if not label or not label[:1].isalnum():
+            self._render()
+            self.query_one("#status", Static).update(
+                "insert: label must start with a letter or digit")
+            return
+        self._insert_label = label
+        save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
+                       insert_label=label)
+        await self._insert_chunk(label)
+
+    async def action_remove_insert(self) -> None:
+        """x: remove the inserted chunk under the cursor (reject-as-supersede,
+        the mark-dismissal pattern) — a mistaken one-keystroke insert needs a
+        one-keystroke out. Layer-0 segments refuse: nothing else is removable."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        if seg.id not in view.inserted_ids:
+            status.update("remove: only inserted (⊕) chunks can be removed")
+            return
+        await commit_chunk_insert_removal(
+            view.queue, view.graph_id, view.source_id, seg.id,
+            self.session_id, actor=self.actor, journal_path=self._journal_path)
+        pos = view.remove_insert_local(seg.id)
+        if pos is not None:
+            self._marks = {(k - 1 if k > pos else k): v
+                           for k, v in self._marks.items() if k != pos}
+            self.cursor = max(0, min(view.size - 1, self.cursor))
+        self._render()
+        status.update(f"⊖ removed inserted chunk"
+                      f" ({seg.start_time:.2f}–{seg.end_time:.2f}s)")
+
+    async def _play_source_span(self, start_s: float, end_s: float) -> None:
+        """Decode + play a source-coordinate span of the ORIGINAL media — the
+        inserted-chunk playback path (no model-input WAV need cover it)."""
+        path = self.view.source_path
+        status = self.query_one("#status", Static)
+        if not path or not Path(path).exists():
+            status.update(f"insert audio: source media not found ({path or 'no path on Source'})")
+            return
+        try:
+            samples = await load_source_slice(path, start_s, end_s,
+                                              samplerate=self.player.samplerate)
+        except (RuntimeError, OSError) as e:
+            status.update(f"insert audio: decode failed — {e}")
+            return
+        if self.speed != 1.0 and len(samples):
+            samples = stretch(samples, self.speed)
+        self.player.play(samples)
+
     async def _shift_boundary(self, direction: str) -> None:
         """One [ / ] press: move ONE word across the boundary AFTER the cursor.
 
@@ -741,6 +910,10 @@ class CorrectionApp(App):
         status = self.query_one("#status", Static)
         if i + 1 >= view.size:
             status.update("boundary shift: no segment after the cursor")
+            return
+        if view.segments[i].id in view.inserted_ids \
+                or view.segments[i + 1].id in view.inserted_ids:
+            status.update("boundary shift: ✋ inserted chunk — its text lives on the overlay (e edits it)")
             return
         if view.aseg_index(i) != view.aseg_index(i + 1):
             status.update("boundary shift: ✋ audio-segment seam — text stays within its audio segment")
@@ -955,6 +1128,7 @@ def save_tui_state(
     cursor: Optional[int],  # Last-focused segment position (None = leave as-is)
     speed: Optional[float] = None,  # Playback-rate preference (db-wide `_speed`; None = leave as-is)
     mark_class: Optional[str] = None,  # Last-used ⚑ class (db-wide `_mark_class`; None = leave as-is)
+    insert_label: Optional[str] = None,  # Last-used ⊕ insert label (db-wide `_insert_label`; None = leave as-is)
     nudge_step_ms: Optional[float] = None,  # Nudge-step preference (db-wide `_nudge_step_ms`; None = leave as-is)
     skeleton: Optional[str] = None,  # Chosen skeleton-spine selector (per-source; None = leave as-is)
     spines: Optional[int] = None,    # Spine-set size the choice was made against (re-prompt key)
@@ -982,6 +1156,8 @@ def save_tui_state(
         state["_speed"] = float(speed)
     if mark_class is not None:
         state["_mark_class"] = str(mark_class)
+    if insert_label is not None:
+        state["_insert_label"] = str(insert_label)
     if nudge_step_ms is not None:
         state["_nudge_step_ms"] = float(nudge_step_ms)
     store.write(state)
