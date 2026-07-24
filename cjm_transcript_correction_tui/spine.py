@@ -327,6 +327,14 @@ class SpineView:
         self.insert_labels.pop(insert_id, None)
         return pos
 
+    @property
+    def seen_insert_labels(self) -> List[str]:
+        """DISTINCT labels on this source's ACTIVE inserts (the I-editor menu's
+        observed tier — the seen_mark_classes semantics: a label leaves when
+        its last carrying insert is removed; proven labels persist by promotion
+        into RECOMMENDED_INSERT_LABELS)."""
+        return sorted({str(lab) for lab in self.insert_labels.values() if lab})
+
     async def close(self) -> None:
         """Tear down the queue + capability stack (app exit)."""
         await self.queue.stop()

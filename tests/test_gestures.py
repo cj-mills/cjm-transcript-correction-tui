@@ -312,6 +312,7 @@ def test_spineview_insert_echo_bookkeeping():
     assert view.segments[1].index == 0 and view.segments[1].text == ""
     assert view.inserted_ids == {"ins1"}
     assert view.insert_labels["ins1"] == "inhale"
+    assert view.seen_insert_labels == ["inhale"]   # the I-menu's observed tier
 
     # a SIBLING insert in the same gap lands after the earlier one (start_time
     # order under the shared layer-0 anchor — the stacked inhale·um·inhale echo)
@@ -331,4 +332,5 @@ def test_spineview_insert_echo_bookkeeping():
     assert view.remove_insert_local("ins1") == 1
     assert [s.id for s in view.segments] == ["a", "b"]
     assert view.inserted_ids == set() and view.insert_labels == {}
+    assert view.seen_insert_labels == []   # a label leaves with its last insert
     assert view.remove_insert_local("ins1") is None

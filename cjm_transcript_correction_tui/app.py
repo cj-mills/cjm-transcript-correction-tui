@@ -15,7 +15,8 @@ from cjm_transcript_correction_core.graph import (commit_boundary_shift_correcti
                                                   commit_time_nudge_correction, LEGACY_SKELETON,
                                                   list_source_spines, record_review_markers,
                                                   start_session)
-from cjm_transcript_correction_core.models import RECOMMENDED_MARK_CLASSES
+from cjm_transcript_correction_core.models import (RECOMMENDED_INSERT_LABELS,
+                                                   RECOMMENDED_MARK_CLASSES)
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -759,10 +760,20 @@ class CorrectionApp(App):
         (insert+nudge completes non-speech isolation with no new machinery)."""
         await self._insert_chunk(None)
 
+    def _insert_label_menu(self) -> List[str]:
+        """Selectable insert labels: the recommended slate first, then labels
+        carried by this source's ACTIVE inserts (the mark-class menu pattern —
+        open vocabulary, slate is DATA; a proven label persists by promotion
+        into RECOMMENDED_INSERT_LABELS)."""
+        return list(RECOMMENDED_INSERT_LABELS) + [
+            c for c in self.view.seen_insert_labels
+            if c not in RECOMMENDED_INSERT_LABELS]
+
     def action_insert_labeled(self) -> None:
         """I: labeled insert — the annotation-class editor (open vocabulary,
-        pre-filled with the last-used label): inhale/um/throat-clear bookends
-        become LABELED spans, the VAD-gold flywheel record."""
+        pre-filled with the last-used label; a leading digit picks from the
+        numbered menu): inhale/hesitation bookends become LABELED spans, the
+        VAD-gold flywheel record."""
         if self._plan_insert() is None:
             return
         editor = self.query_one("#editor", Input)
@@ -770,8 +781,10 @@ class CorrectionApp(App):
         editor.value = f"{self._insert_label} "
         editor.display = True
         editor.focus()
+        menu = self._insert_label_menu()
         self.query_one("#status", Static).update(
-            "insert label (open vocabulary, e.g. inhale · um · throat-clear) · esc cancels")
+            "insert label: class-or-# · "
+            + " ".join(f"{i + 1}:{c}" for i, c in enumerate(menu)))
 
     def _plan_insert(self) -> Optional[Dict[str, Any]]:
         """Plan the insert after the cursor; refusals paint status (None).
@@ -824,8 +837,15 @@ class CorrectionApp(App):
             self.run_worker(self._play_source_span(plan["start_s"], plan["end_s"]))
 
     async def _submit_insert(self, raw: str) -> None:
-        """The I-editor submission: first token = the annotation class."""
+        """The I-editor submission: first token = the annotation class; a
+        leading digit resolves against the numbered menu (the M-picker
+        grammar, shared resolver)."""
         self._close_editor()
+        raw, err = resolve_mark_class_token(raw, self._insert_label_menu())
+        if err:
+            self._render()
+            self.query_one("#status", Static).update(f"insert: {err}")
+            return
         tokens = (raw or "").split()
         if not tokens:
             self._render()
