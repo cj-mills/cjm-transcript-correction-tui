@@ -294,21 +294,28 @@ class SpineView:
 
     def add_insert_local(self, corr: dict) -> Optional[int]:
         """Local echo of a committed chunk insertion: splice the synthetic
-        segment after its left flank (the projection's placement) and return
-        its walk position; None = flank not in this spine (echo refused)."""
+        segment into its gap — after the layer-0 flank, past any SIBLING
+        inserts that start no later (the projection's start_time order, so
+        stacked inhale · um · inhale echo where a reload would place them) —
+        and return its walk position; None = flank not in this spine."""
         p = corr.get("payload") or {}
         pos = next((i for i, s in enumerate(self.segments)
                     if s.id == p.get("after_segment_id")), None)
         if pos is None:
             return None
+        start = float(p.get("start_time") or 0.0)
+        at = pos + 1
+        while at < len(self.segments) and self.segments[at].id in self.inserted_ids \
+                and float(self.segments[at].start_time or 0.0) <= start:
+            at += 1
         seg = SpineSegment(
             id=corr["id"], index=self.segments[pos].index,
             text=str(p.get("text") or ""),
             start_time=p.get("start_time"), end_time=p.get("end_time"))
-        self.segments.insert(pos + 1, seg)
+        self.segments.insert(at, seg)
         self.inserted_ids.add(corr["id"])
         self.insert_labels[corr["id"]] = p.get("label")
-        return pos + 1
+        return at
 
     def remove_insert_local(self, insert_id: str) -> Optional[int]:
         """Local echo of a chunk-insert removal; returns the vacated position."""
@@ -584,37 +591,51 @@ def plan_time_nudge(
 
 def plan_chunk_insert(
     segments: List,          # The walked spine (SpineSegment-shaped: id/start_time/end_time)
-    index: int,              # Cursor position (the insert lands in the gap AFTER it)
+    index: int,              # Cursor position (the insert lands in the seam AFTER it)
     weld_eps: float = 0.01,  # Point-cut weld threshold (seconds)
+    inserted_ids: Optional[set] = None,  # Synthetic ids in the walked spine (anchor resolution)
 ) -> Optional[Dict[str, Any]]:  # {"after_id","before_id","start_s","end_s","welded"}; None = refused
-    """Plan a chunk insertion into the gap after the cursor (the i gesture unit; pure).
+    """Plan a chunk insertion into the seam after the cursor (the i gesture unit; pure).
 
     Whole-gap by default — the de994164 missed-dispatch case is one keystroke.
     At a WELDED point cut (gap within weld_eps — sentence cuts share the exact
     boundary) the insert is born ZERO-WIDTH at the cut; the existing nudge keys
     grow it over the bookends (insert+nudge completes non-speech isolation with
     no new machinery, DEC 3d3fa2a8). At the spine tail (no right neighbor) it
-    is also born zero-width at the last segment's end. Refusals (None): cursor
-    off the spine, missing audio times, or an OVERLAPPING boundary (negative
-    gap beyond the weld eps — hear it with g and nudge the overlap first).
+    is also born zero-width at the last segment's end. The SPAN comes from the
+    WALKED neighbors, but the ANCHORS resolve past synthetic chunks to the
+    nearest LAYER-0 segments (a synthetic anchor would drop as foreign at
+    projection placement) — so inhale · um · inhale STACK in one gap as
+    sibling inserts under a shared anchor, ordered by start_time (drive find,
+    session C.1). Refusals (None): cursor off the spine, missing audio times,
+    an OVERLAPPING boundary (negative gap beyond the weld eps — hear it with g
+    and nudge the overlap first), or no layer-0 segment anywhere left of the
+    seam (nothing to anchor).
     """
     if not (0 <= index < len(segments)):
         return None
+    synthetic = inserted_ids or set()
     left = segments[index]
     if left.start_time is None or left.end_time is None:
+        return None
+    after_id = next((segments[j].id for j in range(index, -1, -1)
+                     if segments[j].id not in synthetic), None)
+    if after_id is None:
         return None
     l_end = float(left.end_time)
     right = segments[index + 1] if index + 1 < len(segments) else None
     if right is None:
-        return {"after_id": left.id, "before_id": None,
+        return {"after_id": after_id, "before_id": None,
                 "start_s": l_end, "end_s": l_end, "welded": True}
     if right.start_time is None or right.end_time is None:
         return None
+    before_id = next((segments[j].id for j in range(index + 1, len(segments))
+                      if segments[j].id not in synthetic), None)
     gap = float(right.start_time) - l_end
     if gap < -weld_eps:
         return None
     if gap < weld_eps:
-        return {"after_id": left.id, "before_id": right.id,
+        return {"after_id": after_id, "before_id": before_id,
                 "start_s": l_end, "end_s": l_end, "welded": True}
-    return {"after_id": left.id, "before_id": right.id,
+    return {"after_id": after_id, "before_id": before_id,
             "start_s": l_end, "end_s": float(right.start_time), "welded": False}

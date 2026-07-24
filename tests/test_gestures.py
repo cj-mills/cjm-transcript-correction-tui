@@ -266,6 +266,20 @@ def test_plan_chunk_insert_gap_weld_tail_refusals():
     assert plan == {"after_id": "b", "before_id": None,
                     "start_s": 9.0, "end_s": 9.0, "welded": True}
 
+    # anchors resolve past synthetics: inhale · um · inhale stack in ONE gap
+    # (C.1 drive find — the after/before anchors must be LAYER-0 ids)
+    stacked = [seg("a", 0.0, 4.5), seg("ins1", 4.5, 5.0), seg("b", 5.0, 9.0)]
+    plan = plan_chunk_insert(stacked, 1, inserted_ids={"ins1"})
+    assert plan == {"after_id": "a", "before_id": "b",
+                    "start_s": 5.0, "end_s": 5.0, "welded": True}
+    # the seam between the real cursor and a synthetic right neighbor works too
+    plan = plan_chunk_insert(stacked, 0, inserted_ids={"ins1"})
+    assert plan["after_id"] == "a" and plan["before_id"] == "b"
+    assert plan["welded"] and plan["start_s"] == 4.5
+    # no layer-0 segment left of the seam: nothing to anchor
+    assert plan_chunk_insert([seg("ins1", 0.0, 1.0)], 0,
+                             inserted_ids={"ins1"}) is None
+
     # overlap beyond the weld eps: refuse (nudge the overlap first)
     overlap = [seg("a", 0.0, 5.2), seg("b", 5.0, 9.0)]
     assert plan_chunk_insert(overlap, 0) is None
@@ -298,6 +312,16 @@ def test_spineview_insert_echo_bookkeeping():
     assert view.segments[1].index == 0 and view.segments[1].text == ""
     assert view.inserted_ids == {"ins1"}
     assert view.insert_labels["ins1"] == "inhale"
+
+    # a SIBLING insert in the same gap lands after the earlier one (start_time
+    # order under the shared layer-0 anchor — the stacked inhale·um·inhale echo)
+    pos = view.add_insert_local(
+        {"id": "ins3", "payload": {"operation": "chunk_insert",
+                                   "after_segment_id": "a", "start_time": 6.0,
+                                   "end_time": 6.0, "label": "um", "text": ""}})
+    assert pos == 2
+    assert [s.id for s in view.segments] == ["a", "ins1", "ins3", "b"]
+    assert view.remove_insert_local("ins3") == 2
 
     # a foreign flank refuses the echo (the reload will place it, or drop it)
     assert view.add_insert_local(

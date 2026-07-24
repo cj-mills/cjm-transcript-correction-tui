@@ -774,20 +774,15 @@ class CorrectionApp(App):
             "insert label (open vocabulary, e.g. inhale · um · throat-clear) · esc cancels")
 
     def _plan_insert(self) -> Optional[Dict[str, Any]]:
-        """Plan the insert after the cursor; every refusal paints status (None)."""
+        """Plan the insert after the cursor; refusals paint status (None).
+        Synthetic neighbors are fine — anchors resolve past them, so sibling
+        inserts stack in one gap (inhale · um · inhale, the C.1 drive find)."""
         view, i = self.view, self.cursor
-        status = self.query_one("#status", Static)
-        if view.segments[i].id in view.inserted_ids:
-            status.update("insert: cursor is already an inserted chunk — nudge its edges instead")
-            return None
-        nxt = view.segments[i + 1] if i + 1 < view.size else None
-        if nxt is not None and nxt.id in view.inserted_ids:
-            status.update("insert: an inserted chunk already fills this gap — nudge its edges")
-            return None
-        plan = plan_chunk_insert(view.segments, i)
+        plan = plan_chunk_insert(view.segments, i, inserted_ids=view.inserted_ids)
         if plan is None:
-            status.update("insert: refused (missing times, or an overlapping "
-                          "boundary — nudge the overlap first)")
+            self.query_one("#status", Static).update(
+                "insert: refused (missing times, or an overlapping "
+                "boundary — nudge the overlap first)")
             return None
         return plan
 
