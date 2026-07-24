@@ -1,8 +1,11 @@
+import asyncio
+import shutil
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from cjm_context_graph_layer.grammar import OverlayRelations, SpineRelations
 from cjm_context_graph_layer.ops import graph_task
 from cjm_context_graph_primitives.query import NodeQuery, OrderBy, RelationPredicate
@@ -59,6 +62,7 @@ class SpineView:
         self.seen_mark_classes: List[str] = []       # DISTINCT classes journaled on this source (open or discharged)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
+        self.source_path: Optional[str] = None       # Original source media path (Source.path; the g/G seam decode target)
 
     @classmethod
     async def open(cls, graph_db_path: Optional[str],       # The shared transcription graph db (None = workspace-resolved)
@@ -153,6 +157,11 @@ class SpineView:
         self._aseg_audio = [
             ChunkRef(wav_by_aseg[aid], start, 0.0) if aid in wav_by_aseg else None
             for aid, start in asegs]
+        # The seam audition (g/G) decodes the ORIGINAL media — resolve its path once.
+        src = await graph_task(self.queue, self.graph_id, "get_node",
+                               node_id=self.source_id)
+        src = src.to_dict() if hasattr(src, "to_dict") else (src or {})
+        self.source_path = str((src.get("properties") or {}).get("path") or "") or None
 
     @property
     def size(self) -> int:  # Total segments in the effective spine
@@ -189,6 +198,34 @@ class SpineView:
         return ChunkRef(stub.wav_path,
                         float(seg.start_time) - stub.start_s,
                         float(seg.end_time) - stub.start_s)
+
+    def seam(self, index: int, direction: int,
+             context_s: float = 2.0) -> Optional["SeamRef"]:
+        """The audio span across the boundary between a segment and its NEIGHBOR
+        (the g/G audition, 6beaa0e4): direction +1 = the boundary AFTER the
+        cursor segment, -1 = the one before.
+
+        FINE-spine boundaries, not coarse-AudioSegment seams (the first-drive
+        correction, 2026-07-23): within a VAD chunk the gap is the FA cut,
+        across chunks it is audio NO chunk ever covered (the de994164
+        missed-slice class), across coarse AudioSegments the source file is the
+        only continuous audio — decoding the SOURCE handles all three
+        uniformly. Span = `context_s` inside each neighbor (clamped to its
+        extent) + the whole gap; `gap_s` stays signed (negative = the segments
+        OVERLAP, itself a 2e42a737-class timing defect worth hearing). None =
+        spine edge or a neighbor without audio times."""
+        left = index if direction > 0 else index - 1
+        right = left + 1
+        if left < 0 or right >= len(self.segments):
+            return None
+        l, r = self.segments[left], self.segments[right]
+        if l.start_time is None or l.end_time is None or \
+           r.start_time is None or r.end_time is None:
+            return None
+        return SeamRef(left=left, right=right,
+                       start_s=max(float(l.start_time), float(l.end_time) - context_s),
+                       end_s=min(float(r.end_time), float(r.start_time) + context_s),
+                       gap_s=float(r.start_time) - float(l.end_time))
 
     def prune_correction_for(self, segment_id: str) -> Optional[dict]:
         """The active prune Correction covering a segment (the unprune anchor), or None."""
@@ -400,3 +437,108 @@ async def source_status(
     return {"segments": len(ares.rows or []),
             "corrections": len(active_corrections(corrections, superseded)),
             "marks": len(open_marks(corrections, superseded))}
+
+
+@dataclass
+class SeamRef:
+    """A source-coordinate audio span across one fine-spine boundary (the g/G
+    audition).
+
+    Per-chunk playback can never sound the audio BETWEEN chunks (work item
+    6beaa0e4, born from the de994164 missed-chunk find), so the span is
+    expressed in SOURCE coordinates for a direct decode of the original media:
+    context tail of the left segment + the whole gap + context head of the
+    right — valid whether the boundary is an FA cut inside one VAD chunk, a
+    real inter-chunk gap, or a coarse-AudioSegment crossing."""
+    left: int       # Left segment position in the walked spine (the boundary follows it)
+    right: int      # Right segment position
+    start_s: float  # Span start (source-coordinate seconds)
+    end_s: float    # Span end (source-coordinate seconds)
+    gap_s: float    # Signed inter-segment gap (right start - left end; negative = overlap)
+
+
+async def load_source_slice(
+    media_path: str,          # The ORIGINAL source media file (any codec, audio or video)
+    start_s: float,           # Span start (source-coordinate seconds)
+    end_s: float,             # Span end (source-coordinate seconds)
+    samplerate: int = 16000,  # Output rate (the ChunkPlayer's model-input rate)
+) -> "np.ndarray":  # float32 mono samples ready for ChunkPlayer.play
+    """Decode a source-coordinate slice of the ORIGINAL media to playable samples.
+
+    The seam-audition decode (6beaa0e4): per-chunk model-input WAVs cannot
+    contain the inter-chunk gap, so this is the one playback read that goes back
+    to the source file. ffmpeg does the demux/seek/resample (the source may be
+    video or any codec); the input-seek form (-ss before -i) keyframe-jumps, so
+    a slice decode stays fast even on long sources. Async subprocess — the TUI
+    event loop keeps painting while ffmpeg works."""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found on PATH")
+    dur = max(0.0, float(end_s) - float(start_s))
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-ss", f"{max(0.0, float(start_s)):.3f}", "-t", f"{dur:.3f}",
+        "-i", media_path, "-vn", "-ac", "1", "-ar", str(samplerate),
+        "-f", "f32le", "pipe:1",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        tail = (err or b"").decode(errors="replace").strip().splitlines()
+        raise RuntimeError(tail[-1] if tail else f"ffmpeg exit {proc.returncode}")
+    return np.frombuffer(out, dtype=np.float32)
+
+
+def plan_time_nudge(
+    segments: List,          # The walked spine (SpineSegment-shaped: id/text/start_time/end_time)
+    index: int,              # Cursor position
+    edge: str,               # "start" | "end" — which edge of the cursor segment moves
+    delta_s: float,          # Signed nudge (seconds; + = later, - = earlier)
+    weld_eps: float = 0.01,  # Point-cut weld threshold (seconds)
+) -> Optional[List[Dict[str, Any]]]:  # commit_time_nudge_correction edits; None = refused
+    """Plan a boundary-time nudge (the ,/. and </> gesture unit; pure).
+
+    The cursor segment's chosen edge moves by delta_s. A WELDED point cut
+    (the neighbor's opposing edge within weld_eps — sentence cuts share the
+    exact boundary) moves the neighbor's edge in the SAME plan, so the cut
+    point stays ONE decision (2e42a737 Example-A class: both edges must move
+    or the clipped word tail just re-appears in the neighbor). Gapped
+    boundaries move one edge only — each key pair drives exactly one edge, so
+    every nudge reverses by the opposite press. Refusals (None): missing audio
+    times, or an edge crossing its segment's other edge (a zero/negative
+    duration) on the cursor segment or a welded neighbor."""
+    if not (0 <= index < len(segments)):
+        return None
+    seg = segments[index]
+    if seg.start_time is None or seg.end_time is None:
+        return None
+    edits: List[Dict[str, Any]] = []
+    if edge == "end":
+        new = float(seg.end_time) + delta_s
+        if new <= float(seg.start_time):
+            return None
+        edits.append({"segment_id": seg.id, "edge": "end",
+                      "old_time": float(seg.end_time), "new_time": new})
+        nxt = segments[index + 1] if index + 1 < len(segments) else None
+        if nxt is not None and nxt.start_time is not None and nxt.end_time is not None \
+                and abs(float(nxt.start_time) - float(seg.end_time)) < weld_eps:
+            n_new = float(nxt.start_time) + delta_s
+            if n_new >= float(nxt.end_time):
+                return None
+            edits.append({"segment_id": nxt.id, "edge": "start",
+                          "old_time": float(nxt.start_time), "new_time": n_new})
+    elif edge == "start":
+        new = float(seg.start_time) + delta_s
+        if new >= float(seg.end_time) or new < 0.0:
+            return None
+        edits.append({"segment_id": seg.id, "edge": "start",
+                      "old_time": float(seg.start_time), "new_time": new})
+        prev = segments[index - 1] if index > 0 else None
+        if prev is not None and prev.start_time is not None and prev.end_time is not None \
+                and abs(float(seg.start_time) - float(prev.end_time)) < weld_eps:
+            p_new = float(prev.end_time) + delta_s
+            if p_new <= float(prev.start_time):
+                return None
+            edits.append({"segment_id": prev.id, "edge": "end",
+                          "old_time": float(prev.end_time), "new_time": p_new})
+    else:
+        return None
+    return edits

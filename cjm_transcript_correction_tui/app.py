@@ -1,24 +1,27 @@
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.journal import sidecar_journal_path
-from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk
+from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk, stretch
 from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_mark_correction, commit_mark_dismissal,
                                                   commit_prune_amendment, commit_text_correction,
-                                                  LEGACY_SKELETON, list_source_spines,
-                                                  record_review_markers, start_session)
+                                                  commit_time_nudge_correction, LEGACY_SKELETON,
+                                                  list_source_spines, record_review_markers,
+                                                  start_session)
 from cjm_transcript_correction_core.models import RECOMMENDED_MARK_CLASSES
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .spine import (list_sources, match_sources, open_stack, parse_mark_input, plan_boundary_shift,
-                    resolve_mark_class_token, source_status, SpineView)
+from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_mark_input,
+                    plan_boundary_shift, plan_time_nudge, resolve_mark_class_token, source_status,
+                    SpineView)
 
 
 class CorrectionApp(App):
@@ -43,6 +46,10 @@ class CorrectionApp(App):
 
     SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)  # the [ ] playback-rate ladder (0.5/3.0 = the comprehension bounds, drive-round-7 verdict)
 
+    NUDGE_STEPS_MS = (5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)  # the { } nudge-step ladder (first drive: 100ms fits some cuts, others need 20/10/5 — granularity is per-BOUNDARY)
+
+    NUDGE_TAIL_S = 2.0  # Max seconds of segment TAIL an end-nudge replays (the edge under judgment, not the whole segment)
+
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
     """
@@ -55,6 +62,14 @@ class CorrectionApp(App):
         Binding("up", "prev", "prev", show=False),
         Binding("w", "prev", "prev", show=False),
         Binding("r", "replay", "replay"),
+        Binding("g", "seam_next", "seam audio"),
+        Binding("G", "seam_prev", "seam audio ←", show=False),
+        Binding("comma", "nudge_end_earlier", "nudge −", key_display=","),
+        Binding("full_stop", "nudge_end_later", "nudge +", key_display="."),
+        Binding("less_than_sign", "nudge_start_earlier", "start −", show=False),
+        Binding("greater_than_sign", "nudge_start_later", "start +", show=False),
+        Binding("left_curly_bracket", "nudge_step_down", "step −", show=False, key_display="{"),
+        Binding("right_curly_bracket", "nudge_step_up", "step +", show=False, key_display="}"),
         Binding("left_square_bracket", "speed_down", "slower", key_display="["),
         Binding("right_square_bracket", "speed_up", "faster", key_display="]"),
         Binding("e", "edit", "edit text"),
@@ -86,7 +101,8 @@ class CorrectionApp(App):
                  autoplay: bool = True,                   # Auto-play the focused chunk
                  audio_device: Optional[object] = None,   # Output device (None = system default)
                  resume: bool = True,                     # Reopen at the source's last-focused segment
-                 shift_floor_s: float = 0.0):             # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
+                 shift_floor_s: float = 0.0,              # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
+                 nudge_step_ms: Optional[float] = None):  # Boundary time-nudge step per ,/. press; None = sidecar-persisted preference, else 100 (the { } ladder adjusts live)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition, skeleton=skeleton)
@@ -117,6 +133,9 @@ class CorrectionApp(App):
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
         self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
+        self._nudge_step_arg = nudge_step_ms  # explicit --nudge-step-ms (wins over the sidecar; None = defer)
+        self._nudge_step = 0.1             # seconds per nudge press (resolved at spine open: flag > sidecar > 100ms)
+        self._nudge_busy = False           # in-flight nudge commit (key-repeat throttle)
         self.resume = resume
         self._state_saved = 0.0            # last sidecar bookmark write (monotonic; 1s throttle)
 
@@ -188,6 +207,15 @@ class CorrectionApp(App):
             self.speed = float(state.get("_speed") or 1.0)
         except (TypeError, ValueError):
             self.speed = 1.0
+        # Nudge step: explicit flag > sidecar preference > 100ms (same
+        # preference tier as speed; the { } ladder adjusts + persists it).
+        try:
+            saved_ms = float(state.get("_nudge_step_ms") or 0.0)
+        except (TypeError, ValueError):
+            saved_ms = 0.0
+        step_ms = (float(self._nudge_step_arg) if self._nudge_step_arg is not None
+                   else (saved_ms if saved_ms > 0 else 100.0))
+        self._nudge_step = step_ms / 1000.0
         mc = str(state.get("_mark_class") or "suspect")
         self._mark_class = mc if mc[:1].isalnum() else "suspect"   # heal a junk-class sidecar
         self.cursor = 0                    # the picker borrowed the cursor
@@ -305,7 +333,7 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
             f"  ·  marked {done}  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · \\[/] speed · e edit · y copy"
+            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge · {{}} step · \\[/] speed · e edit · y copy"
             f" · space/u ±reviewed · m/b/M ⚑mark · n/N⚑ p/P✂ jump · q quit")
 
     def _render_picker(self) -> None:
@@ -432,6 +460,149 @@ class CorrectionApp(App):
 
     def action_replay(self) -> None:
         self._play_cursor()
+
+    async def action_seam_next(self) -> None:
+        await self._audition_seam(1)
+
+    async def action_seam_prev(self) -> None:
+        await self._audition_seam(-1)
+
+    async def _audition_seam(self, direction: int) -> None:
+        """g/G: play the SOURCE audio across the boundary after/before the
+        CURSOR SEGMENT — context tail + the whole gap + context head.
+
+        Boundaries are fine-spine boundaries (first-drive correction,
+        2026-07-23) — an FA cut, a real inter-chunk gap, or a coarse-segment
+        crossing all audition the same way, because the decode goes back to the
+        original source file, the only place the between-chunk audio exists
+        (6beaa0e4, the de994164 missed-montage class). Everything that can fail
+        is checked BEFORE any sound stops; Esc stops playback like any other
+        chunk."""
+        status = self.query_one("#status", Static)
+        ref = self.view.seam(self.cursor, direction)
+        if ref is None:
+            status.update("seam audio: no neighbor segment in that direction")
+            return
+        path = self.view.source_path
+        if not path or not Path(path).exists():
+            status.update(f"seam audio: source media not found ({path or 'no path on Source'})")
+            return
+        self.player.stop()
+        status.update(f"seam audio: decoding source {ref.start_s:.1f}–{ref.end_s:.1f}s …")
+        try:
+            samples = await load_source_slice(path, ref.start_s, ref.end_s,
+                                              samplerate=self.player.samplerate)
+        except (RuntimeError, OSError) as e:
+            status.update(f"seam audio: decode failed — {e}")
+            return
+        if self.speed != 1.0 and len(samples):
+            samples = stretch(samples, self.speed)
+        self.player.play(samples)
+        segs = self.view.segments
+        status.update(
+            f"♪ seam #{segs[ref.left].index}|#{segs[ref.right].index}:"
+            f" source {ref.start_s:.1f}–{ref.end_s:.1f}s"
+            f" (gap {ref.gap_s:+.2f}s) · esc stops")
+
+    async def action_nudge_end_earlier(self) -> None:
+        await self._nudge("end", -1)
+
+    async def action_nudge_end_later(self) -> None:
+        await self._nudge("end", 1)
+
+    async def action_nudge_start_earlier(self) -> None:
+        await self._nudge("start", -1)
+
+    async def action_nudge_start_later(self) -> None:
+        await self._nudge("start", 1)
+
+    def action_nudge_step_down(self) -> None:
+        self._step_nudge(-1)
+
+    def action_nudge_step_up(self) -> None:
+        self._step_nudge(1)
+
+    def _step_nudge(self, delta: int) -> None:
+        """{ / }: step the nudge increment along the ladder and persist it
+        (sidecar preference, the speed pattern). First drive found the right
+        granularity is per-BOUNDARY — 100ms fit some cuts, others needed
+        20/10/5ms — so the step must adjust mid-walk, not per-launch."""
+        cur = self._nudge_step * 1000.0
+        i = min(range(len(self.NUDGE_STEPS_MS)),
+                key=lambda j: abs(self.NUDGE_STEPS_MS[j] - cur))
+        ms = self.NUDGE_STEPS_MS[max(0, min(len(self.NUDGE_STEPS_MS) - 1, i + delta))]
+        self._nudge_step = ms / 1000.0
+        save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
+                       nudge_step_ms=ms)
+        self.query_one("#status", Static).update(f"nudge step: {ms:g} ms")
+
+    async def _nudge(self, edge: str, sign: int) -> None:
+        """,/. (cursor END) and </> (cursor START): nudge a boundary TIME by
+        ±--nudge-step-ms, then replay the updated cursor segment so the ear
+        verifies at once (g/G stays the manual cross-boundary check).
+
+        The 3f9948d6 surface over commit_time_nudge_correction: welded point
+        cuts (sentence cuts share the exact boundary) move both edges in ONE
+        atomic correction via plan_time_nudge; the journal records old/new per
+        edge + the boundary words, so VAD+FA finetuning pairs derive straight
+        from the correction journal (the flywheel). Key-repeat drops while a
+        commit is in flight (the shift-throttle pattern); no review marker —
+        a nudge is a time decision, not a text verdict."""
+        if self._nudge_busy:
+            return
+        view, i = self.view, self.cursor
+        status = self.query_one("#status", Static)
+        delta = sign * self._nudge_step
+        plan = plan_time_nudge(view.segments, i, edge, delta)
+        if plan is None:
+            status.update(f"nudge: refused ({edge} {delta:+.3f}s — missing times, "
+                          "or a segment would collapse)")
+            return
+        segs = view.segments
+        if edge == "end":
+            left_t = segs[i].text
+            right_t = segs[i + 1].text if i + 1 < view.size else ""
+        else:
+            left_t = segs[i - 1].text if i > 0 else ""
+            right_t = segs[i].text
+        words = {"left": (left_t.split() or [None])[-1],
+                 "right": (right_t.split() or [None])[0]}
+        self._nudge_busy = True
+        try:
+            await commit_time_nudge_correction(
+                view.queue, view.graph_id, view.source_id, plan,
+                self.session_id, boundary_words=words, step_s=delta,
+                actor=self.actor, journal_path=self._journal_path)
+        finally:
+            self._nudge_busy = False
+        by_id = {s.id: s for s in segs}
+        for e in plan:   # local echo — the paint + replay read the nudged times
+            s = by_id[e["segment_id"]]
+            if e["edge"] == "start":
+                s.start_time = e["new_time"]
+            else:
+                s.end_time = e["new_time"]
+        self._render()
+        # Immediate audible verification: replay the UPDATED CURSOR SEGMENT —
+        # whether the word now fits its chunk is the thing the ear must judge
+        # (user drive feedback: the g/G span muddied over/undershoot; press
+        # g/G manually for cross-boundary context). END nudges replay only the
+        # segment TAIL — a long segment must not make the ear wait to reach
+        # the edge under judgment (second drive refinement).
+        if edge == "end":
+            c = self.view.chunk(i)
+            if c is None:
+                self.player.stop()
+            else:
+                tail = max(c.start_s, c.end_s - self.NUDGE_TAIL_S)
+                self.player.play(load_chunk(c.wav_path, tail, c.end_s, speed=self.speed))
+        else:
+            self._play_cursor()
+        e0 = plan[0]
+        welded = " ⚭" if len(plan) > 1 else ""
+        status.update(
+            f"⏱ #{segs[i].index} {e0['edge']} {e0['old_time']:.2f}→{e0['new_time']:.2f}s"
+            f" ({delta:+.3f}s){welded} · replaying segment")
 
     def _step_speed(self, delta: int) -> None:
         """Step the playback rate along the preset ladder, re-sound the chunk at the
@@ -784,6 +955,7 @@ def save_tui_state(
     cursor: Optional[int],  # Last-focused segment position (None = leave as-is)
     speed: Optional[float] = None,  # Playback-rate preference (db-wide `_speed`; None = leave as-is)
     mark_class: Optional[str] = None,  # Last-used ⚑ class (db-wide `_mark_class`; None = leave as-is)
+    nudge_step_ms: Optional[float] = None,  # Nudge-step preference (db-wide `_nudge_step_ms`; None = leave as-is)
     skeleton: Optional[str] = None,  # Chosen skeleton-spine selector (per-source; None = leave as-is)
     spines: Optional[int] = None,    # Spine-set size the choice was made against (re-prompt key)
 ) -> None:
@@ -810,6 +982,8 @@ def save_tui_state(
         state["_speed"] = float(speed)
     if mark_class is not None:
         state["_mark_class"] = str(mark_class)
+    if nudge_step_ms is not None:
+        state["_nudge_step_ms"] = float(nudge_step_ms)
     store.write(state)
 
 

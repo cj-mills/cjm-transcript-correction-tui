@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "(the async commit guard is the real governor — a 1ms floor read as "
                         "residual keystroke latency in the 2026-07-14 drive). "
                         "Measure key rates with tests_manual/keyrate_probe.py")
+    p.add_argument("--nudge-step-ms", type=float, default=None,
+                   help="Boundary time-nudge step per ,/. (end) or </> (start) press, "
+                        "milliseconds. Adjustable IN-TUI with { } along the "
+                        "5/10/20/50/100/200/500 ladder (the choice persists in the "
+                        "sidecar); this flag overrides the persisted preference "
+                        "(default: sidecar, else 100)")
     return p
 
 
@@ -72,6 +78,7 @@ def main() -> int:  # Console-script entry point
                         skeleton=args.skeleton,
                         actor=args.actor, autoplay=not args.no_autoplay,
                         audio_device=device, resume=not args.no_resume,
-                        shift_floor_s=args.shift_floor_ms / 1000.0)
+                        shift_floor_s=args.shift_floor_ms / 1000.0,
+                        nudge_step_ms=args.nudge_step_ms)
     app.run()
     return 0
