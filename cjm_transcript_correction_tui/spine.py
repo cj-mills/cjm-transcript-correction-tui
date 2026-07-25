@@ -12,9 +12,10 @@ from cjm_context_graph_primitives.query import NodeQuery, OrderBy, RelationPredi
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_transcript_correction_core.cli import load_capabilities
-from cjm_transcript_correction_core.graph import (active_corrections, load_source_corrections,
-                                                  load_source_segments, mark_anchor_segments,
-                                                  open_marks, project_effective_spine,
+from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
+                                                  load_source_corrections, load_source_segments,
+                                                  mark_anchor_segments, open_marks,
+                                                  project_effective_spine,
                                                   resolve_source_renditions)
 from cjm_transcript_correction_core.models import SpineSegment
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
@@ -62,6 +63,7 @@ class SpineView:
         self.seen_mark_classes: List[str] = []       # DISTINCT classes journaled on this source (open or discharged)
         self.inserted_ids: set = set()               # Synthetic chunk-insert segment ids (⊕ paint + gesture routing)
         self.insert_labels: Dict[str, Optional[str]] = {}  # insert id -> annotation label
+        self.speakers: Dict[str, Dict[str, Any]] = {}  # segment id -> active speaker assignment (DEC d6df3a8e)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
         self.source_path: Optional[str] = None       # Original source media path (Source.path; the g/G seam decode target)
@@ -122,6 +124,9 @@ class SpineView:
         # (corrections_to_edits has no arm for correction_type "mark" — DEC 2a231843).
         self._open_marks = open_marks(corrections, superseded)
         self._recompute_marked_ids()
+        # Active speaker assignments (attribute overlay — never touches text/times):
+        # the assign lane paints + corrects these (DEC d6df3a8e / 8a4df244).
+        self.speakers = active_speaker_assignments(corrections, superseded)
         # The correction surface walks the FULL VAD skeleton (the 1:1 invariant):
         # prune corrections are NOT applied to this view — an "empty" chunk may hold
         # speech that FA starved (the falsified D14 premise), and an empty chunk is
@@ -269,6 +274,13 @@ class SpineView:
             str((m.get("payload") or {}).get("mark_class"))
             for m in self._open_marks
             if (m.get("payload") or {}).get("mark_class")})
+
+    def assign_local(self, segment_ids: List[str], entity_id: str,
+                     verdict: str, correction_id: str) -> None:
+        """Local echo of a committed speaker assignment (latest-wins per segment)."""
+        for sid in segment_ids:
+            self.speakers[str(sid)] = {"entity_id": entity_id, "verdict": verdict,
+                                       "correction_id": correction_id}
 
     def marks_for(self, segment_id: str) -> List[dict]:
         """The open marks anchored to a segment (oldest first) — dismissal targets."""
@@ -647,3 +659,19 @@ def plan_chunk_insert(
                 "start_s": l_end, "end_s": l_end, "welded": True}
     return {"after_id": after_id, "before_id": before_id,
             "start_s": l_end, "end_s": float(right.start_time), "welded": False}
+
+
+def parse_entity_input(
+    raw: str,  # The A-editor submission: `name` | `? descriptive handle`
+) -> Optional[Tuple[str, bool]]:  # (canonical_name, provisional); None = nothing usable
+    """Parse the new-speaker editor line (pure). A leading `?` marks the entity
+    PROVISIONAL — a descriptive handle, not an identification (DEC 484e2d74:
+    `? HH montage narrator`); anything else is the canonical name. Identifying
+    later is a rename on the stable entity id."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    prov = s.startswith("?")
+    if prov:
+        s = s.lstrip("?").strip()
+    return (s, prov) if s else None

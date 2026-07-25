@@ -11,9 +11,11 @@ from cjm_transcript_correction_core.graph import (commit_boundary_shift_correcti
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_insert_removal,
                                                   commit_mark_correction, commit_mark_dismissal,
-                                                  commit_prune_amendment, commit_text_correction,
+                                                  commit_prune_amendment,
+                                                  commit_speaker_assign_correction,
+                                                  commit_speaker_entity, commit_text_correction,
                                                   commit_time_nudge_correction, LEGACY_SKELETON,
-                                                  list_source_spines, record_review_markers,
+                                                  list_source_spines, list_speaker_entities,
                                                   start_session)
 from cjm_transcript_correction_core.models import (RECOMMENDED_INSERT_LABELS,
                                                    RECOMMENDED_MARK_CLASSES)
@@ -22,8 +24,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_mark_input,
-                    plan_boundary_shift, plan_chunk_insert, plan_time_nudge,
+from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_entity_input,
+                    parse_mark_input, plan_boundary_shift, plan_chunk_insert, plan_time_nudge,
                     resolve_mark_class_token, source_status, SpineView)
 
 
@@ -52,6 +54,15 @@ class CorrectionApp(App):
     NUDGE_STEPS_MS = (5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)  # the { } nudge-step ladder (first drive: 100ms fits some cuts, others need 20/10/5 — granularity is per-BOUNDARY)
 
     NUDGE_TAIL_S = 2.0  # Max seconds of segment TAIL an end-nudge replays (the edge under judgment, not the whole segment)
+
+    # Lane vocabulary (DEC cc55a7b5 multi-lane workbench, v1 = walk + assign per
+    # 8a4df244): the assign lane exposes ONLY these actions; assign-only actions
+    # are inert in the walk lane. One data table, one check_action gate.
+    ASSIGN_LANE_ACTIONS = frozenset({
+        "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+        "yank", "assign_pick", "assign_same", "assign_new", "cycle_lane",
+        "cancel", "quit_app"})
+    ASSIGN_ONLY_ACTIONS = frozenset({"assign_pick", "assign_same", "assign_new"})
 
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
@@ -84,8 +95,14 @@ class CorrectionApp(App):
         Binding("d", "shift_push", "push word", show=False),
         Binding("left", "shift_pull", "pull word", key_display="←"),
         Binding("a", "shift_pull", "pull word", show=False),
-        Binding("space", "reviewed", "mark reviewed"),
-        Binding("u", "unreview", "un-review"),
+        Binding("tab", "cycle_lane", "lane", show=False),
+        Binding("space", "assign_same", "same speaker", show=False),
+        Binding("A", "assign_new", "new speaker", show=False),
+        Binding("1", "assign_pick(1)", show=False), Binding("2", "assign_pick(2)", show=False),
+        Binding("3", "assign_pick(3)", show=False), Binding("4", "assign_pick(4)", show=False),
+        Binding("5", "assign_pick(5)", show=False), Binding("6", "assign_pick(6)", show=False),
+        Binding("7", "assign_pick(7)", show=False), Binding("8", "assign_pick(8)", show=False),
+        Binding("9", "assign_pick(9)", show=False),
         Binding("m", "mark_quick", "mark"),
         Binding("b", "mark_boundary", "mark boundary"),
         Binding("M", "mark_editor", "mark+class"),
@@ -109,6 +126,7 @@ class CorrectionApp(App):
                  resume: bool = True,                     # Reopen at the source's last-focused segment
                  shift_floor_s: float = 0.0,              # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
                  nudge_step_ms: Optional[float] = None,   # Boundary time-nudge step per ,/. press; None = sidecar-persisted preference, else 100 (the { } ladder adjusts live)
+                 lane: Optional[str] = None,              # Starting pass lane ("walk" | "assign"); None = sidecar-persisted preference, else walk (DEC 8a4df244)
                  purpose: Optional[str] = None):          # None = genuine pass; "feature-test" tags the session excludable from flywheel datasets (--test, DEC c86714a4)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
@@ -138,7 +156,11 @@ class CorrectionApp(App):
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._mark_class = "suspect"       # last-used ⚑ class (m/b repeat it; sidecar-persisted)
         self._insert_label = "inhale"      # last-used ⊕ insert label (I pre-fills it; sidecar-persisted)
-        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark")
+        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark" | "insert" | "assign")
+        self.lane = lane or "walk"         # active pass lane ("walk" | "assign"; tab cycles, sidecar persists)
+        self._lane_arg = lane              # explicit --lane (wins over the sidecar; None = defer)
+        self._entities: List[Dict[str, Any]] = []  # speaker Entity registry (graph-side, source-spanning)
+        self._active_entity: Optional[str] = None  # entity id space assigns ("same speaker continues")
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
         self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
@@ -230,6 +252,12 @@ class CorrectionApp(App):
         self._mark_class = mc if mc[:1].isalnum() else "suspect"   # heal a junk-class sidecar
         il = str(state.get("_insert_label") or "inhale")
         self._insert_label = il if il[:1].isalnum() else "inhale"
+        # Lane: explicit flag > sidecar preference > walk (DEC 8a4df244); the
+        # speaker Entity registry loads once per open (source-spanning, people-scale).
+        saved_lane = str(state.get("_lane") or "")
+        self.lane = self._lane_arg or (saved_lane if saved_lane in ("walk", "assign") else "walk")
+        self._entities = await list_speaker_entities(self.view.queue, self.view.graph_id)
+        self._active_entity = None
         self.cursor = 0                    # the picker borrowed the cursor
         if self.resume:
             saved = state.get(self.view.source_id)
@@ -256,7 +284,10 @@ class CorrectionApp(App):
         seg = view.segments[pos]
         gut_w = self._gutter_w
         lane_w = max(10, width - gut_w)
-        mark = {"reviewed": "✓", "corrected": "✎"}.get(self._marks.get(pos, ""), "·")
+        # Corrected-state DERIVES from committed corrections; the manual
+        # reviewed verdict is retired (DEC c1bb202f — absence of edits IS the
+        # no-edits signal, a stored claim of absence can only go stale).
+        mark = "✎" if self._marks.get(pos) == "corrected" else "·"
         # Gutter styling must ride SPANS, not the Text base style: lane text is
         # appended onto these same row objects, and a base style would bleed
         # into it (the round-2 drive regression — first two lane lines dimmed).
@@ -281,6 +312,14 @@ class CorrectionApp(App):
             body = Text(f"(inserted{': ' + lab if lab else ''})", style="cyan")
         else:
             body = Text("(empty)", style="dim")
+        if self.lane == "assign":
+            # Attribution chip: the assign lane's object of attention rides the
+            # text lane (gutter width stays source-stable). ∅ = unassigned.
+            sp = view.speakers.get(seg.id)
+            chip = (Text(f"{self._entity_name(sp['entity_id'])[:14]} ▏", style="magenta")
+                    if sp else Text("∅ ▏", style="dim"))
+            chip.append_text(body)
+            body = chip
         if abs(pos - self.cursor) > 1 and seg.text:
             body.stylize("dim")
         lane = body.wrap(self.console, lane_w)
@@ -352,12 +391,33 @@ class CorrectionApp(App):
             pos += 1
         self.query_one("#cards", Static).update(
             Text("\n").join(ln if ln is not None else Text("") for ln in rows))
-        done = sum(1 for v in self._marks.values() if v)
-        self.query_one("#status", Static).update(
-            f"{view.source_title}  ·  segment {self.cursor + 1}/{view.size}"
-            f"  ·  marked {done}  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
-            f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge · {{}} step · \\[/] speed · e edit · y copy"
-            f" · i/I ⊕insert · x ⊖remove · space/u ±reviewed · m/b/M ⚑mark · n/N⚑ p/P✂ jump · q quit")
+        self.query_one("#status", Static).update(self._status_line())
+
+    def _status_line(self) -> str:
+        """The unified status strip (DEC cc55a7b5): lane badge + session-lane
+        badge (d915d545 b — TEST PASS under --test, nothing when genuine) +
+        position + lane-scoped counters + the ACTIVE LANE's keybar only."""
+        view = self.view
+        badges = "\\[ASSIGN]" if self.lane == "assign" else "\\[WALK]"
+        if self.purpose:
+            badges += (" \\[TEST PASS]" if self.purpose == "feature-test"
+                       else f" \\[{self.purpose.upper()}]")
+        head = (f"{badges}  {view.source_title}"
+                f"  ·  segment {self.cursor + 1}/{view.size}")
+        tail = f"  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
+        if self.lane == "assign":
+            assigned = sum(1 for s in view.segments if s.id in view.speakers)
+            active = (self._entity_name(self._active_entity)
+                      if self._active_entity else "none")
+            return (f"{head}  ·  assigned {assigned}/{view.size}"
+                    f"  ·  speaker: {active}{tail}"
+                    f"  ·  1-9 pick · space same · A new · j/k walk · r replay"
+                    f" · g/G seam · \\[/] speed · y copy · tab walk-lane · q quit")
+        edited = sum(1 for v in self._marks.values() if v == "corrected")
+        return (f"{head}  ·  edited {edited}{tail}"
+                f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
+                f" · {{}} step · \\[/] speed · e edit · y copy · i/I ⊕insert · x ⊖remove"
+                f" · m/b/M ⚑mark · n/N⚑ p/P✂ jump · tab assign-lane · q quit")
 
     def _render_picker(self) -> None:
         """The 2ce81638 discovery stage: the graph's Sources with correction
@@ -415,12 +475,18 @@ class CorrectionApp(App):
             "pick a spine  ·  j/k walk · enter open (choice persists) · q quit")
 
     def check_action(self, action: str, parameters) -> bool:
-        """Stage gate: during the picker only walk/open/quit act — the whole
-        correction vocabulary stays inert until a spine is open (view-None
-        crash guard, one gate instead of twenty)."""
+        """Stage gate + LANE gate (one data table, one gate — DEC cc55a7b5).
+
+        During the picker only walk/open/quit act (view-None crash guard). In
+        the walk, the ACTIVE LANE scopes the vocabulary: the assign lane
+        exposes only ASSIGN_LANE_ACTIONS; assign-only actions are inert in the
+        walk lane (lane-scoping is what makes the space overload safe,
+        8a4df244)."""
         if self.stage in ("select", "spine"):
             return action in ("next", "prev", "open_source", "quit_app")
-        return True
+        if self.lane == "assign":
+            return action in self.ASSIGN_LANE_ACTIONS
+        return action not in self.ASSIGN_ONLY_ACTIONS
 
     async def action_open_source(self) -> None:
         if self.stage == "spine":
@@ -699,6 +765,9 @@ class CorrectionApp(App):
         if self._input_mode == "insert":
             await self._submit_insert(event.value)
             return
+        if self._input_mode == "assign":
+            await self._submit_assign(event.value)
+            return
         seg = self.view.segments[self.cursor]
         new_text = event.value
         if new_text != seg.text:
@@ -731,30 +800,115 @@ class CorrectionApp(App):
         self.set_focus(None)
         self._input_mode = "edit"
 
-    async def action_reviewed(self) -> None:
-        seg = self.view.segments[self.cursor]
-        await record_review_markers(self.view.queue, self.view.graph_id,
-                                    self.session_id, [(seg.id, "reviewed")],
-                                    journal_path=self._journal_path)
-        self._marks.setdefault(self.cursor, "reviewed")
-        self._move(1)
-
-    async def action_unreview(self) -> None:
-        """u: undo an accidental space — appends an 'unreviewed' RE-DECISION
-        (review markers are events; the read is latest-wins), so the segment
-        returns to undecided for this session. Committed corrections are NOT
-        touched: undo those by supersession (re-edit / the opposite shift)."""
-        seg = self.view.segments[self.cursor]
-        await record_review_markers(self.view.queue, self.view.graph_id,
-                                    self.session_id, [(seg.id, "unreviewed")],
-                                    journal_path=self._journal_path)
-        was = self._marks.get(self.cursor)
-        if was == "reviewed":
-            self._marks.pop(self.cursor, None)
+    def action_cycle_lane(self) -> None:
+        """tab: cycle the pass lane (walk <-> assign). Lane is a VIEW preference
+        (sidecar-persisted, db-wide) — corrections are spine state, the lane
+        only scopes which vocabulary is live (DEC cc55a7b5 / 8a4df244)."""
+        self.lane = "assign" if self.lane == "walk" else "walk"
+        save_tui_state(self._graph_db_path, self.view.source_id, None, lane=self.lane)
         self._render()
-        note = ("" if was != "corrected"
-                else " (corrections stay — supersede via re-edit / opposite shift)")
-        self.query_one("#status", Static).update(f"un-reviewed #{seg.index}{note}")
+        if self.lane == "assign":
+            menu = self._assign_menu()
+            if menu:
+                self.query_one("#status", Static).update(
+                    "assign: " + " · ".join(f"{i + 1}:{nm}" for i, (_, nm) in enumerate(menu[:6]))
+                    + (" · …" if len(menu) > 6 else "") + " · A new")
+
+    def _entity_name(self, entity_id: Optional[str]) -> str:
+        """Display name for an entity id; provisional handles read with a
+        leading ? (a DESCRIPTION, not an identification — DEC 484e2d74)."""
+        for d in self._entities:
+            if d.get("id") == entity_id:
+                p = d.get("properties") or {}
+                nm = str(p.get("canonical_name") or str(entity_id)[:8])
+                return f"?{nm}" if p.get("provisional") else nm
+        return str(entity_id or "")[:8]
+
+    def _assign_menu(self) -> List[Tuple[str, str]]:
+        """The layered digit menu (DEC 4ec6a49c): THIS source's assigned
+        speakers first (spine encounter order), then the rest of the registry
+        (name order) — capped at the 9 digit keys; A mints new."""
+        seen: List[str] = []
+        for s in self.view.segments:
+            sp = self.view.speakers.get(s.id)
+            if sp and sp.get("entity_id") and sp["entity_id"] not in seen:
+                seen.append(sp["entity_id"])
+        rest = [d["id"] for d in self._entities if d["id"] not in seen]
+        return [(eid, self._entity_name(eid)) for eid in (seen + rest)[:9]]
+
+    async def action_assign_pick(self, n: int) -> None:
+        """1-9: assign the cursor segment to menu speaker #n (and make it the
+        active speaker the space run continues)."""
+        menu = self._assign_menu()
+        if not (1 <= n <= len(menu)):
+            self.query_one("#status", Static).update(
+                f"assign: no speaker #{n} — A mints a new one")
+            return
+        self._active_entity = menu[n - 1][0]
+        await self._commit_assign(menu[n - 1][0])
+
+    async def action_assign_same(self) -> None:
+        """space (assign lane): same speaker continues — assign the ACTIVE
+        entity to the cursor segment and advance. One keystroke per segment:
+        the single-narrator fast path (DEC 8a4df244)."""
+        if self._active_entity is None:
+            self.query_one("#status", Static).update(
+                "assign: no active speaker — pick 1-9 or A new")
+            return
+        await self._commit_assign(self._active_entity)
+
+    def action_assign_new(self) -> None:
+        """A: mint a speaker — `Name`, or `? descriptive handle` for a
+        PROVISIONAL entity (distinct voice, unknown identity; DEC 484e2d74).
+        Exact name matches reuse the existing entity instead of duplicating."""
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "assign"
+        editor.value = ""
+        editor.display = True
+        editor.focus()
+        self.query_one("#status", Static).update(
+            'new speaker: Name · "? handle" = provisional (unknown identity)')
+
+    async def _submit_assign(self, raw: str) -> None:
+        self._close_editor()
+        parsed = parse_entity_input(raw)
+        if parsed is None:
+            self._render()
+            return
+        name, provisional = parsed
+        for d in self._entities:   # exact-name reuse: the registry stays deduplicated
+            p = d.get("properties") or {}
+            if str(p.get("canonical_name") or "").lower() == name.lower():
+                self._active_entity = d["id"]
+                await self._commit_assign(d["id"])
+                return
+        eid = await commit_speaker_entity(
+            self.view.queue, self.view.graph_id, name, self.session_id,
+            provisional=provisional, actor=self.actor,
+            journal_path=self._journal_path)
+        self._entities.append({"id": eid, "properties": {
+            "canonical_name": name, "provisional": provisional, "kind": "person"}})
+        self._active_entity = eid
+        await self._commit_assign(eid)
+
+    async def _commit_assign(self, entity_id: str) -> None:
+        """Commit one speaker assignment on the cursor segment and advance.
+
+        verdict=name (the proposal-less manual walk — accept/cluster-merge
+        activate when diarization proposals exist, DEC 8a4df244); reassignment
+        needs no supersede: the projection is latest-wins per segment, the
+        re-decision CHAIN is the record (the nudge precedent)."""
+        seg = self.view.segments[self.cursor]
+        corr_id = await commit_speaker_assign_correction(
+            self.view.queue, self.view.graph_id, self.view.source_id,
+            [seg.id], entity_id, self.session_id, verdict="name",
+            actor=self.actor, journal_path=self._journal_path)
+        self.view.assign_local([seg.id], entity_id, "name", corr_id)
+        idx = seg.index
+        self._move(1)
+        self._render()
+        self.query_one("#status", Static).update(
+            f"@ #{idx} → {self._entity_name(entity_id)}")
 
     async def action_insert_chunk(self) -> None:
         """i: insert a chunk into the gap AFTER the cursor (DEC 3d3fa2a8) —
@@ -1148,6 +1302,7 @@ def save_tui_state(
     mark_class: Optional[str] = None,  # Last-used ⚑ class (db-wide `_mark_class`; None = leave as-is)
     insert_label: Optional[str] = None,  # Last-used ⊕ insert label (db-wide `_insert_label`; None = leave as-is)
     nudge_step_ms: Optional[float] = None,  # Nudge-step preference (db-wide `_nudge_step_ms`; None = leave as-is)
+    lane: Optional[str] = None,      # Pass-lane preference (db-wide `_lane`; None = leave as-is)
     skeleton: Optional[str] = None,  # Chosen skeleton-spine selector (per-source; None = leave as-is)
     spines: Optional[int] = None,    # Spine-set size the choice was made against (re-prompt key)
 ) -> None:
@@ -1178,6 +1333,8 @@ def save_tui_state(
         state["_insert_label"] = str(insert_label)
     if nudge_step_ms is not None:
         state["_nudge_step_ms"] = float(nudge_step_ms)
+    if lane is not None:
+        state["_lane"] = str(lane)
     store.write(state)
 
 

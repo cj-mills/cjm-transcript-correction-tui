@@ -334,3 +334,61 @@ def test_spineview_insert_echo_bookkeeping():
     assert view.inserted_ids == set() and view.insert_labels == {}
     assert view.seen_insert_labels == []   # a label leaves with its last insert
     assert view.remove_insert_local("ins1") is None
+
+
+def test_lane_gate_scopes_the_vocabulary():
+    """DEC cc55a7b5/8a4df244: one check_action gate — assign lane exposes only
+    its vocabulary, assign-only actions are inert in the walk lane, picker
+    stages stay gated to walk/open/quit, and the retired reviewed gestures
+    (DEC c1bb202f) are gone from the binding roster."""
+    from cjm_transcript_correction_tui.app import CorrectionApp
+    app = CorrectionApp()
+    app.stage = "correct"
+    app.lane = "walk"
+    assert app.check_action("edit", ()) and app.check_action("next", ())
+    assert app.check_action("cycle_lane", ())
+    assert not app.check_action("assign_same", ())
+    assert not app.check_action("assign_pick", ())
+    app.lane = "assign"
+    assert app.check_action("assign_pick", ()) and app.check_action("assign_new", ())
+    assert app.check_action("next", ()) and app.check_action("cycle_lane", ())
+    assert not app.check_action("edit", ()) and not app.check_action("insert_chunk", ())
+    assert not app.check_action("mark_quick", ())
+    app.stage = "select"
+    assert app.check_action("next", ()) and not app.check_action("assign_pick", ())
+    actions = {b.action for b in app.BINDINGS}
+    assert "reviewed" not in actions and "unreview" not in actions
+    assert "assign_same" in {a.split("(")[0] for a in actions}
+
+
+def test_parse_entity_input_provisional():
+    """DEC 484e2d74: a leading ? marks a descriptive PROVISIONAL handle."""
+    from cjm_transcript_correction_tui.spine import parse_entity_input
+    assert parse_entity_input("Dan Carlin") == ("Dan Carlin", False)
+    assert parse_entity_input("? HH montage narrator") == ("HH montage narrator", True)
+    assert parse_entity_input("?HH promo voice A") == ("HH promo voice A", True)
+    assert parse_entity_input("?") is None
+    assert parse_entity_input("   ") is None
+
+
+def test_assign_menu_layers_source_speakers_first():
+    """DEC 4ec6a49c: digit menu = this source's assigned speakers (encounter
+    order) then the rest of the registry; provisional names read with ?."""
+    from cjm_transcript_correction_core.models import SpineSegment
+    from cjm_transcript_correction_tui.app import CorrectionApp
+    from cjm_transcript_correction_tui.spine import SpineView
+    app = CorrectionApp()
+    app._entities = [
+        {"id": "e-b", "properties": {"canonical_name": "Bob"}},
+        {"id": "e-a", "properties": {"canonical_name": "Alice"}},
+        {"id": "e-n", "properties": {"canonical_name": "HH montage narrator",
+                                     "provisional": True}}]
+    view = SpineView.__new__(SpineView)
+    view.segments = [SpineSegment(id=f"s{i}", index=i, text="t") for i in range(3)]
+    view.speakers = {"s2": {"entity_id": "e-n", "verdict": "name", "correction_id": "c1"},
+                     "s0": {"entity_id": "e-a", "verdict": "name", "correction_id": "c2"}}
+    app.view = view
+    menu = app._assign_menu()
+    assert [m[0] for m in menu] == ["e-a", "e-n", "e-b"]
+    assert menu[1][1] == "?HH montage narrator"
+    assert app._entity_name("e-a") == "Alice"
