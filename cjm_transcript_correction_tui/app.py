@@ -16,7 +16,7 @@ from cjm_transcript_correction_core.graph import (commit_boundary_shift_correcti
                                                   commit_speaker_entity, commit_text_correction,
                                                   commit_time_nudge_correction, LEGACY_SKELETON,
                                                   list_source_spines, list_speaker_entities,
-                                                  start_session)
+                                                  session_purposes_by_source, start_session)
 from cjm_transcript_correction_core.models import (RECOMMENDED_INSERT_LABELS,
                                                    RECOMMENDED_MARK_CLASSES)
 from rich.text import Text
@@ -144,6 +144,7 @@ class CorrectionApp(App):
         self._queue = None
         self._sources: List[Tuple[str, str]] = []     # [(source_id, title)] the picker walks
         self._status: Dict[str, Dict[str, int]] = {}  # source_id -> status-at-a-glance
+        self._purposes: Dict[str, Dict[str, int]] = {}  # source_id -> session-purpose mix (d915d545 a)
         self.view: Optional[SpineView] = None
         self.player: Optional[ChunkPlayer] = None
         self.cursor = 0
@@ -194,6 +195,9 @@ class CorrectionApp(App):
         self._sources = picked if len(picked) > 1 else sources
         for sid, _ in self._sources:
             self._status[sid] = await source_status(self._queue, self._graph_cap, sid)
+        # Purpose mix at a glance (d915d545 a): which sources carry only
+        # dev-era feature-test edits vs genuine passes — one sessions read.
+        self._purposes = await session_purposes_by_source(self._queue, self._graph_cap)
         self.cursor = 0
         self._render()
 
@@ -438,6 +442,16 @@ class CorrectionApp(App):
             marks = st.get("marks", 0)
             if marks:
                 row.append(f" · {marks} ⚑", style="yellow")
+            mix = self._purposes.get(sid) or {}
+            genuine = mix.get("genuine", 0)
+            tests = sum(n for p, n in mix.items() if p != "genuine")
+            if genuine:
+                # Genuine passes are the flywheel feedstock — the count leads.
+                row.append(f" · genuine: {genuine}", style="green")
+                if tests:
+                    row.append(f" (+{tests} test)", style="dim")
+            elif tests:
+                row.append(" · all test", style="yellow")
             row.truncate(width)
             lines.append(row)
         self.query_one("#cards", Static).update(Text("\n").join(lines))
