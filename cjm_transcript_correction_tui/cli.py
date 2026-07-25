@@ -38,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "default: the in-TUI spine picker (choice persists in the sidecar)")
     p.add_argument("--actor", default="human",
                    help="Actor recorded on corrections + review markers")
+    p.add_argument("--test", action="store_true",
+                   help="Tag the minted session purpose=\"feature-test\" — feature-test "
+                        "passes are structurally excludable from flywheel datasets "
+                        "(noise hygiene, DEC c86714a4); genuine passes omit the tag")
     p.add_argument("--no-autoplay", action="store_true",
                    help="Do not auto-play the focused segment's VAD chunk")
     p.add_argument("--audio-device", default=None,
@@ -79,6 +83,7 @@ def main() -> int:  # Console-script entry point
                         actor=args.actor, autoplay=not args.no_autoplay,
                         audio_device=device, resume=not args.no_resume,
                         shift_floor_s=args.shift_floor_ms / 1000.0,
-                        nudge_step_ms=args.nudge_step_ms)
+                        nudge_step_ms=args.nudge_step_ms,
+                        purpose="feature-test" if args.test else None)
     app.run()
     return 0

@@ -108,7 +108,8 @@ class CorrectionApp(App):
                  audio_device: Optional[object] = None,   # Output device (None = system default)
                  resume: bool = True,                     # Reopen at the source's last-focused segment
                  shift_floor_s: float = 0.0,              # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
-                 nudge_step_ms: Optional[float] = None):  # Boundary time-nudge step per ,/. press; None = sidecar-persisted preference, else 100 (the { } ladder adjusts live)
+                 nudge_step_ms: Optional[float] = None,   # Boundary time-nudge step per ,/. press; None = sidecar-persisted preference, else 100 (the { } ladder adjusts live)
+                 purpose: Optional[str] = None):          # None = genuine pass; "feature-test" tags the session excludable from flywheel datasets (--test, DEC c86714a4)
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition, skeleton=skeleton)
@@ -129,6 +130,7 @@ class CorrectionApp(App):
         self.player: Optional[ChunkPlayer] = None
         self.cursor = 0
         self.actor = actor
+        self.purpose = purpose
         self.autoplay = autoplay
         self.speed = 1.0                   # playback rate ([ ] preset ladder; sidecar-persisted preference)
         self.audio_device = audio_device
@@ -206,7 +208,8 @@ class CorrectionApp(App):
         self.stage = "correct"
         sess = await start_session(self.view.queue, self.view.graph_id,
                                    [self.view.source_id],
-                                   journal_path=self._journal_path)
+                                   journal_path=self._journal_path,
+                                   purpose=self.purpose)
         self.session_id = sess.id
         state = load_tui_state(self._graph_db_path)
         try:
