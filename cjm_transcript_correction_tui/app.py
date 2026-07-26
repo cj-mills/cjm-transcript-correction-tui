@@ -879,19 +879,38 @@ class CorrectionApp(App):
         await self._commit_assign(self._active_entity)
 
     def action_assign_new(self) -> None:
-        """A: mint a speaker — `Name`, or `? descriptive handle` for a
-        PROVISIONAL entity (distinct voice, unknown identity; DEC 484e2d74).
-        Exact name matches reuse the existing entity instead of duplicating."""
+        """A: the speaker editor — a bare digit picks from the numbered menu
+        (the M mark-editor pattern; scales past the 1-9 direct keys), `Name`
+        mints, `? descriptive handle` mints PROVISIONAL (distinct voice,
+        unknown identity; DEC 484e2d74). Exact name matches reuse the existing
+        entity instead of duplicating."""
         editor = self.query_one("#editor", Input)
         self._input_mode = "assign"
         editor.value = ""
         editor.display = True
         editor.focus()
+        menu = self._assign_menu()
+        listing = " · ".join(f"{i + 1}:{nm}" for i, (_, nm) in enumerate(menu))
         self.query_one("#status", Static).update(
-            'new speaker: Name · "? handle" = provisional (unknown identity)')
+            'speaker: #-or-Name · "? handle" = provisional'
+            + (f" · {listing}" if listing else ""))
 
     async def _submit_assign(self, raw: str) -> None:
         self._close_editor()
+        token = (raw or "").strip()
+        if token.isdigit():
+            # Bare digit = menu pick (the mark-editor precedent) — the path
+            # that scales when a source carries more speakers than digit keys.
+            menu = self._assign_menu()
+            n = int(token)
+            if not (1 <= n <= len(menu)):
+                self._render()
+                self.query_one("#status", Static).update(
+                    f"assign: no speaker #{n} — menu has {len(menu)}")
+                return
+            self._active_entity = menu[n - 1][0]
+            await self._commit_assign(menu[n - 1][0])
+            return
         parsed = parse_entity_input(raw)
         if parsed is None:
             self._render()
