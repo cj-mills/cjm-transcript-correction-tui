@@ -95,7 +95,7 @@ class CorrectionApp(App):
         Binding("d", "shift_push", "push word", show=False),
         Binding("left", "shift_pull", "pull word", key_display="←"),
         Binding("a", "shift_pull", "pull word", show=False),
-        Binding("tab", "cycle_lane", "lane", show=False),
+        Binding("tab", "cycle_lane", "lane", show=False, priority=True),
         Binding("space", "assign_same", "same speaker", show=False),
         Binding("A", "assign_new", "new speaker", show=False),
         Binding("1", "assign_pick(1)", show=False), Binding("2", "assign_pick(2)", show=False),
@@ -817,7 +817,14 @@ class CorrectionApp(App):
     def action_cycle_lane(self) -> None:
         """tab: cycle the pass lane (walk <-> assign). Lane is a VIEW preference
         (sidecar-persisted, db-wide) — corrections are spine state, the lane
-        only scopes which vocabulary is live (DEC cc55a7b5 / 8a4df244)."""
+        only scopes which vocabulary is live (DEC cc55a7b5 / 8a4df244).
+
+        priority=True on the binding: Textual's Screen binds tab to focus_next,
+        which silently shadows app-level BINDINGS (first-drive find 2026-07-25
+        — tab did nothing); the escape binding is the in-repo precedent. The
+        editor guard keeps a priority tab from hijacking an open edit."""
+        if self.query_one("#editor", Input).display:
+            return
         self.lane = "assign" if self.lane == "walk" else "walk"
         save_tui_state(self._graph_db_path, self.view.source_id, None, lane=self.lane)
         self._render()
