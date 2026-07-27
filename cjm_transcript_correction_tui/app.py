@@ -10,6 +10,7 @@ from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_insert_removal,
+                                                  commit_chunk_split_correction,
                                                   commit_mark_correction, commit_mark_dismissal,
                                                   commit_prune_amendment,
                                                   commit_speaker_assign_correction,
@@ -25,8 +26,8 @@ from textual.binding import Binding
 from textual.widgets import Input, Static
 
 from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_entity_input,
-                    parse_mark_input, plan_boundary_shift, plan_chunk_insert, plan_time_nudge,
-                    resolve_mark_class_token, source_status, SpineView)
+                    parse_mark_input, plan_boundary_shift, plan_chunk_insert, plan_chunk_split,
+                    plan_time_nudge, resolve_mark_class_token, source_status, SpineView)
 
 
 class CorrectionApp(App):
@@ -90,6 +91,7 @@ class CorrectionApp(App):
         Binding("i", "insert_chunk", "insert chunk"),
         Binding("I", "insert_labeled", "insert+label", show=False),
         Binding("x", "remove_insert", "remove insert", show=False),
+        Binding("S", "split_chunk", "split chunk", show=False),
         Binding("e", "edit", "edit text"),
         Binding("y", "yank", "copy text"),
         Binding("right", "shift_push", "push word", key_display="→"),
@@ -159,7 +161,7 @@ class CorrectionApp(App):
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._mark_class = "suspect"       # last-used ⚑ class (m/b repeat it; sidecar-persisted)
         self._insert_label = "inhale"      # last-used ⊕ insert label (I pre-fills it; sidecar-persisted)
-        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark" | "insert" | "assign")
+        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark" | "insert" | "assign" | "split")
         self.lane = lane or "walk"         # active pass lane ("walk" | "assign"; tab cycles, sidecar persists)
         self._lane_arg = lane              # explicit --lane (wins over the sidecar; None = defer)
         self._entities: List[Dict[str, Any]] = []  # speaker Entity registry (graph-side, source-spanning)
@@ -797,6 +799,9 @@ class CorrectionApp(App):
         if self._input_mode == "assign":
             await self._submit_assign(event.value)
             return
+        if self._input_mode == "split":
+            await self._submit_split(event.value, event.input.cursor_position)
+            return
         seg = self.view.segments[self.cursor]
         new_text = event.value
         if new_text != seg.text:
@@ -1157,6 +1162,72 @@ class CorrectionApp(App):
         save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
                        insert_label=label)
         await self._insert_chunk(label)
+
+    def action_split_chunk(self) -> None:
+        """S: split the cursor chunk at a word boundary (work item 99c1d2ba) —
+        the dual of i-insert: a boundary INSIDE the chunk. The editor opens
+        with the segment's text; place the caret where the cut belongs and
+        enter commits — the seed time interpolates the caret's character
+        fraction, and the { } ladder + ,/. nudges + g audition own the
+        precision (sub-word truth comes from nudging AFTER the split). Unlocks
+        the flywheel spans locked inside original VAD chunks: split before and
+        after an inhale/um, then mark or label the isolated middle."""
+        seg = self.view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        if seg.id in self.view.pruned_ids:
+            status.update("split: pruned position — e-edit text first (rescue), then split")
+            return
+        if len((seg.text or "").split()) < 2:
+            status.update("split: needs at least two words (both halves must keep text)")
+            return
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "split"
+        editor.value = seg.text
+        editor.display = True
+        editor.focus()
+        editor.cursor_position = 0
+        status.update("split: place the caret at the cut point · enter splits · esc cancels")
+
+    async def _submit_split(self, value: str, caret: int) -> None:
+        """The S-editor submission: split the cursor chunk at the caret (the
+        text AS SUBMITTED partitions, so a typo fixed while placing the caret
+        rides the halves). Commit = ONE atomic batch of the three composed
+        verbs + ONE chunk-split journal op (the new-boundary flywheel record);
+        the local echo mirrors the projection and the cursor stays on the LEFT
+        half so ,/. tunes the new welded seam at once."""
+        self._close_editor()
+        view, i = self.view, self.cursor
+        seg = view.segments[i]
+        status = self.query_one("#status", Static)
+        plan = plan_chunk_split(view.segments, i, caret, text=value,
+                                inserted_ids=view.inserted_ids)
+        if plan is None:
+            self._render()
+            status.update("split: refused (the caret must leave words on both"
+                          " sides of the cut, and the chunk needs audio times)")
+            return
+        old_text = seg.text
+        ids = await commit_chunk_split_correction(
+            view.queue, view.graph_id, view.source_id, plan["segment_id"],
+            plan["split_s"], plan["left_text"], plan["right_text"], plan["end_s"],
+            self.session_id, plan["after_id"], before_segment_id=plan["before_id"],
+            old_text=old_text, boundary_words=plan["boundary_words"],
+            actor=self.actor, journal_path=self._journal_path)
+        pos = view.split_local(i, plan["left_text"], plan["split_s"],
+                               {"id": ids["insert_id"],
+                                "payload": {"operation": "chunk_insert",
+                                            "after_segment_id": plan["after_id"],
+                                            "start_time": plan["split_s"],
+                                            "end_time": plan["end_s"],
+                                            "label": None,
+                                            "text": plan["right_text"]}})
+        if pos is not None:
+            # _marks is POSITIONAL: positions at/after the splice shift right
+            # (the insert echo's indexing perturbation, DEC 3d3fa2a8 known cost).
+            self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
+        self._render()
+        status.update(f"✂ split #{seg.index} at {plan['split_s']:.2f}s (caret-seeded)"
+                      " — ,/. tunes the new seam · g auditions it")
 
     async def action_remove_insert(self) -> None:
         """x: remove the inserted chunk under the cursor (reject-as-supersede,

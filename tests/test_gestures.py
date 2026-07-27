@@ -392,3 +392,95 @@ def test_assign_menu_layers_source_speakers_first():
     assert [m[0] for m in menu] == ["e-a", "e-n", "e-b"]
     assert menu[1][1] == "?HH montage narrator"
     assert app._entity_name("e-a") == "Alice"
+
+
+def test_plan_chunk_split_caret_seed_and_anchors():
+    """The S gesture unit (work item 99c1d2ba): caret partitions the text
+    (whitespace-normalized halves), the time seed interpolates the caret
+    fraction and clamps strictly inside the span, anchors resolve past
+    synthetics to layer-0 flanks, and edge-of-text carets refuse (that is a
+    nudge, not a split)."""
+    from types import SimpleNamespace
+
+    from cjm_transcript_correction_tui.spine import plan_chunk_split
+
+    segs = [SimpleNamespace(id="a", text="alpha beta gamma",
+                            start_time=10.0, end_time=14.0),
+            SimpleNamespace(id="b", text="tail", start_time=14.0, end_time=16.0)]
+    # caret after "alpha " (6 of 16 chars): halves strip the boundary space,
+    # seed = 10 + 4 * 6/16 = 11.5, boundary words bank the flywheel context
+    plan = plan_chunk_split(segs, 0, 6)
+    assert plan is not None
+    assert (plan["left_text"], plan["right_text"]) == ("alpha", "beta gamma")
+    assert abs(plan["split_s"] - 11.5) < 1e-9 and plan["end_s"] == 14.0
+    assert (plan["after_id"], plan["before_id"]) == ("a", "b")
+    assert plan["boundary_words"] == {"left": "alpha", "right": "beta"}
+
+    # the submitted text overrides the segment text (a typo fixed in the editor)
+    fixed = plan_chunk_split(segs, 0, 6, text="alfax beta gamma")
+    assert fixed["left_text"] == "alfax"
+
+    # edge-of-text carets refuse: both halves must keep words
+    assert plan_chunk_split(segs, 0, 0) is None
+    assert plan_chunk_split(segs, 0, len(segs[0].text)) is None
+    assert plan_chunk_split(segs, 0, 3) is not None   # mid-word caret still splits
+    # missing times / off-spine refuse
+    assert plan_chunk_split(segs, 5, 3) is None
+    assert plan_chunk_split([SimpleNamespace(id="x", text="a b", start_time=None,
+                                             end_time=None)], 0, 1) is None
+
+    # splitting a SYNTHETIC: anchors resolve past it to the layer-0 flanks
+    synth = SimpleNamespace(id="ins-1", text="um inhale", start_time=14.2,
+                            end_time=15.0)
+    walked = [segs[0], synth, segs[1]]
+    p2 = plan_chunk_split(walked, 1, 2, inserted_ids={"ins-1"})
+    assert p2 is not None
+    assert p2["segment_id"] == "ins-1"
+    assert (p2["after_id"], p2["before_id"]) == ("a", "b")
+
+    # the clamp keeps the seed strictly inside a short span (no collapsed half)
+    tiny = [SimpleNamespace(id="t", text="hm um", start_time=0.0, end_time=0.02)]
+    pt = plan_chunk_split(tiny, 0, 2)
+    assert pt is not None and 0.0 < pt["split_s"] < 0.02
+
+
+def test_spineview_split_echo():
+    """Local echo of a chunk split (hermetic): the target keeps the LEFT half
+    (text truncated, end pulled to the cut) and the right half splices as a
+    synthetic sibling directly after it — welded at split_s, exactly what a
+    projection reload composes."""
+    from cjm_transcript_correction_core.models import SpineSegment
+
+    view = SpineView.__new__(SpineView)
+    view.segments = [SpineSegment(id="a", index=0, text="alpha beta gamma",
+                                  start_time=0.0, end_time=6.0),
+                     SpineSegment(id="b", index=1, text="tail",
+                                  start_time=6.0, end_time=9.0)]
+    view.inserted_ids = set()
+    view.insert_labels = {}
+
+    pos = view.split_local(0, "alpha", 2.0,
+                           {"id": "sp1", "payload": {"operation": "chunk_insert",
+                                                     "after_segment_id": "a",
+                                                     "start_time": 2.0, "end_time": 6.0,
+                                                     "label": None,
+                                                     "text": "beta gamma"}})
+    assert pos == 1
+    assert [s.id for s in view.segments] == ["a", "sp1", "b"]
+    assert (view.segments[0].text, view.segments[0].end_time) == ("alpha", 2.0)
+    assert (view.segments[1].text, view.segments[1].start_time,
+            view.segments[1].end_time) == ("beta gamma", 2.0, 6.0)
+    assert "sp1" in view.inserted_ids
+
+    # splitting the SYNTHETIC right half echoes uniformly: the new piece walks
+    # past its sibling under the shared layer-0 anchor (start_time order)
+    pos = view.split_local(1, "beta", 4.0,
+                           {"id": "sp2", "payload": {"operation": "chunk_insert",
+                                                     "after_segment_id": "a",
+                                                     "start_time": 4.0, "end_time": 6.0,
+                                                     "label": None, "text": "gamma"}})
+    assert pos == 2
+    assert [s.id for s in view.segments] == ["a", "sp1", "sp2", "b"]
+    assert [(s.text, s.start_time, s.end_time) for s in view.segments] == [
+        ("alpha", 0.0, 2.0), ("beta", 2.0, 4.0), ("gamma", 4.0, 6.0),
+        ("tail", 6.0, 9.0)]

@@ -364,6 +364,17 @@ class SpineView:
         self.insert_labels[corr["id"]] = p.get("label")
         return at
 
+    def split_local(self, index: int, left_text: str, split_s: float,
+                    corr: dict) -> Optional[int]:
+        """Local echo of a committed chunk split: the target keeps the LEFT
+        half (text truncated, end pulled to the cut), and the right half
+        splices as a synthetic sibling via the insert echo — the same
+        placement a projection reload would produce (welded at split_s)."""
+        seg = self.segments[index]
+        seg.text = left_text
+        seg.end_time = split_s
+        return self.add_insert_local(corr)
+
     def remove_insert_local(self, insert_id: str) -> Optional[int]:
         """Local echo of a chunk-insert removal; returns the vacated position."""
         pos = next((i for i, s in enumerate(self.segments) if s.id == insert_id), None)
@@ -710,3 +721,56 @@ def parse_entity_input(
     if prov:
         s = s.lstrip("?").strip()
     return (s, prov) if s else None
+
+
+def plan_chunk_split(
+    segments: List,          # The walked spine (SpineSegment-shaped: id/text/start_time/end_time)
+    index: int,              # Cursor position (the segment being split)
+    caret: int,              # Character offset into `text` — the cut falls BEFORE this position
+    text: Optional[str] = None,  # Text to partition (None = the segment's effective text; the S editor's value may carry fixes)
+    inserted_ids: Optional[set] = None,  # Synthetic ids in the walked spine (anchor resolution)
+) -> Optional[Dict[str, Any]]:  # {"segment_id","after_id","before_id","split_s","left_text","right_text","end_s","boundary_words"}; None = refused
+    """Plan a chunk split at a caret position (the S gesture unit; pure).
+
+    The dual of plan_chunk_insert: a boundary INSIDE the chunk instead of a
+    chunk in a gap. The time seed INTERPOLATES the caret's character fraction
+    over the segment's span — word-level FA times don't reach this surface and
+    don't need to: the seed lands near the cut, and the { } ladder + ,/.
+    nudges + g audition own the precision (the toolkit's own regime — the cut
+    is born WELDED, so one nudge key moves both new edges atomically). Both
+    halves must keep words (an edge-of-text caret is a nudge, not a split);
+    the seed clamps strictly inside the span so neither half is born
+    collapsed. Anchors resolve past synthetics to the nearest LAYER-0 flanks
+    (the plan_chunk_insert rule), so splitting a SYNTHETIC insert works
+    uniformly — its right half stacks under the shared anchor by start_time.
+    Refusals (None): cursor off the spine, missing audio times, an empty half,
+    or no layer-0 anchor left of the cut."""
+    if not (0 <= index < len(segments)):
+        return None
+    seg = segments[index]
+    if seg.start_time is None or seg.end_time is None:
+        return None
+    body = (seg.text if text is None else text) or ""
+    at = max(0, min(len(body), int(caret)))
+    left_text = body[:at].rstrip()
+    right_text = body[at:].lstrip()
+    if not left_text or not right_text:
+        return None
+    start, end = float(seg.start_time), float(seg.end_time)
+    if end <= start:
+        return None
+    synthetic = inserted_ids or set()
+    after_id = next((segments[j].id for j in range(index, -1, -1)
+                     if segments[j].id not in synthetic), None)
+    if after_id is None:
+        return None
+    before_id = next((segments[j].id for j in range(index + 1, len(segments))
+                      if segments[j].id not in synthetic), None)
+    eps = min(0.01, (end - start) / 4.0)
+    split_s = start + (end - start) * (at / len(body))
+    split_s = max(start + eps, min(end - eps, split_s))
+    return {"segment_id": seg.id, "after_id": after_id, "before_id": before_id,
+            "split_s": split_s, "left_text": left_text, "right_text": right_text,
+            "end_s": end,
+            "boundary_words": {"left": left_text.split()[-1],
+                               "right": right_text.split()[0]}}
