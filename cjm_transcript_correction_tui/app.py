@@ -11,6 +11,7 @@ from cjm_transcript_correction_core.graph import (commit_boundary_shift_correcti
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_insert_removal,
                                                   commit_chunk_split_correction,
+                                                  commit_chunk_split_removal,
                                                   commit_mark_correction, commit_mark_dismissal,
                                                   commit_prune_amendment,
                                                   commit_speaker_assign_correction,
@@ -1093,7 +1094,8 @@ class CorrectionApp(App):
         Synthetic neighbors are fine — anchors resolve past them, so sibling
         inserts stack in one gap (inhale · um · inhale, the C.1 drive find)."""
         view, i = self.view, self.cursor
-        plan = plan_chunk_insert(view.segments, i, inserted_ids=view.inserted_ids)
+        plan = plan_chunk_insert(view.segments, i, inserted_ids=view.inserted_ids,
+                                 insert_ranks=view.insert_ranks)
         if plan is None:
             self.query_one("#status", Static).update(
                 "insert: refused (missing times, or an overlapping "
@@ -1113,13 +1115,13 @@ class CorrectionApp(App):
             view.queue, view.graph_id, view.source_id,
             plan["after_id"], plan["start_s"], plan["end_s"], self.session_id,
             before_segment_id=plan["before_id"], label=label,
-            actor=self.actor, journal_path=self._journal_path)
+            rank=plan["rank"], actor=self.actor, journal_path=self._journal_path)
         pos = view.add_insert_local(
             {"id": insert_id,
              "payload": {"operation": "chunk_insert",
                          "after_segment_id": plan["after_id"],
                          "start_time": plan["start_s"], "end_time": plan["end_s"],
-                         "label": label, "text": ""}})
+                         "label": label, "text": "", "rank": plan["rank"]}})
         if pos is not None:
             # _marks is POSITIONAL (cursor -> decision echo): positions at/after
             # the splice shift right — the walk-indexing perturbation the design
@@ -1221,6 +1223,12 @@ class CorrectionApp(App):
                                             "end_time": plan["end_s"],
                                             "label": None,
                                             "text": plan["right_text"]}})
+        # Register the group so x on the fresh right half UNSPLITS without a
+        # reload (the ac84360a marker, cashed in by action_remove_insert).
+        view.split_groups[ids["insert_id"]] = {
+            "group_ids": [ids["text_id"], ids["nudge_id"]],
+            "target_id": plan["segment_id"], "old_text": old_text,
+            "old_end": plan["end_s"]}
         if pos is not None:
             # _marks is POSITIONAL: positions at/after the splice shift right
             # (the insert echo's indexing perturbation, DEC 3d3fa2a8 known cost).
@@ -1232,24 +1240,40 @@ class CorrectionApp(App):
     async def action_remove_insert(self) -> None:
         """x: remove the inserted chunk under the cursor (reject-as-supersede,
         the mark-dismissal pattern) — a mistaken one-keystroke insert needs a
-        one-keystroke out. Layer-0 segments refuse: nothing else is removable."""
+        one-keystroke out. A SPLIT's right half UNSPLITS instead: superseding
+        only the insert would orphan its text and leave the target truncated
+        at the cut (FINDING 131ba57a follow-on — the retyping cost), so x
+        supersedes the whole split group and the target gets its pre-split
+        text and end back. Layer-0 segments refuse: nothing else is removable."""
         view = self.view
         seg = view.segments[self.cursor]
         status = self.query_one("#status", Static)
         if seg.id not in view.inserted_ids:
             status.update("remove: only inserted (⊕) chunks can be removed")
             return
-        await commit_chunk_insert_removal(
-            view.queue, view.graph_id, view.source_id, seg.id,
-            self.session_id, actor=self.actor, journal_path=self._journal_path)
-        pos = view.remove_insert_local(seg.id)
+        info = view.split_groups.get(seg.id)
+        if info:
+            await commit_chunk_split_removal(
+                view.queue, view.graph_id, view.source_id, seg.id,
+                info["group_ids"], self.session_id, actor=self.actor,
+                journal_path=self._journal_path)
+            pos = view.unsplit_local(seg.id)
+        else:
+            await commit_chunk_insert_removal(
+                view.queue, view.graph_id, view.source_id, seg.id,
+                self.session_id, actor=self.actor, journal_path=self._journal_path)
+            pos = view.remove_insert_local(seg.id)
         if pos is not None:
             self._marks = {(k - 1 if k > pos else k): v
                            for k, v in self._marks.items() if k != pos}
             self.cursor = max(0, min(view.size - 1, self.cursor))
         self._render()
-        status.update(f"⊖ removed inserted chunk"
-                      f" ({seg.start_time:.2f}–{seg.end_time:.2f}s)")
+        if info:
+            status.update(f"⊖ unsplit: right half removed, target restored"
+                          f" (text + end back to {seg.end_time:.2f}s)")
+        else:
+            status.update(f"⊖ removed inserted chunk"
+                          f" ({seg.start_time:.2f}–{seg.end_time:.2f}s)")
 
     async def _play_source_span(self, start_s: float, end_s: float) -> None:
         """Decode + play a source-coordinate span of the ORIGINAL media — the

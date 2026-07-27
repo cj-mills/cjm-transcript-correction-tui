@@ -66,6 +66,8 @@ class SpineView:
         self.seen_mark_classes: List[str] = []       # DISTINCT classes journaled on this source (open or discharged)
         self.inserted_ids: set = set()               # Synthetic chunk-insert segment ids (⊕ paint + gesture routing)
         self.insert_labels: Dict[str, Optional[str]] = {}  # insert id -> annotation label
+        self.insert_ranks: Dict[str, float] = {}     # insert id -> stack rank (walked-order tie-break, 131ba57a)
+        self.split_groups: Dict[str, Dict[str, Any]] = {}  # right-half insert id -> its split group (the x-unsplit target)
         self.speakers: Dict[str, Dict[str, Any]] = {}  # segment id -> active speaker assignment (DEC d6df3a8e)
         self.turn_proposals: Dict[str, Dict[str, Any]] = {}  # segment id -> {"cluster","overlap","coverage"} (diarization overlay; {} = no turns artifact)
         self.turns_meta: Dict[str, Any] = {}          # Turns-artifact provenance (capability + metadata) — status strip + accept-op snapshots
@@ -159,6 +161,28 @@ class SpineView:
                and (c.get("payload") or {}).get("operation") == "chunk_insert"]
         self.inserted_ids = {c["id"] for c in ins}
         self.insert_labels = {c["id"]: (c.get("payload") or {}).get("label") for c in ins}
+        self.insert_ranks = {c["id"]: float((c.get("payload") or {}).get("rank") or 0.0)
+                             for c in ins}
+        # Split groups (ac84360a marker): an insert born as a split's right
+        # half maps to its companion text/nudge corrections + the pre-split
+        # target snapshot — x on it UNSPLITS (supersedes the whole decision)
+        # instead of orphaning the right text (131ba57a follow-on).
+        self.split_groups = {}
+        for c in ins:
+            if c.get("rationale") != "chunk-split":
+                continue
+            group = [g for g in active if g.get("rationale") == f"chunk-split:{c['id']}"]
+            if not group:
+                continue
+            txt = next((g for g in group
+                        if g.get("correction_type") == "text_content"), {})
+            ndg = next((g for g in group if g.get("correction_type") == "timing"), {})
+            edits = (ndg.get("payload") or {}).get("edits") or [{}]
+            self.split_groups[c["id"]] = {
+                "group_ids": [g["id"] for g in group],
+                "target_id": (txt.get("payload") or {}).get("segment_id"),
+                "old_text": (txt.get("payload") or {}).get("old_text"),
+                "old_end": edits[0].get("old_time")}
         rend_ids = set(await resolve_source_renditions(
             self.queue, self.graph_id, self.source_id, rendition))
         aq = NodeQuery(label=TranscriptGraphLabels.AUDIO_SEGMENT,
@@ -351,9 +375,14 @@ class SpineView:
         if pos is None:
             return None
         start = float(p.get("start_time") or 0.0)
+        rank = float(p.get("rank") or 0.0)
         at = pos + 1
+        # (start_time, rank) mirrors the projection's sibling key — equal keys
+        # place after (created later), a lower rank overtakes a same-start
+        # sibling (the walked-order tie-break, 131ba57a).
         while at < len(self.segments) and self.segments[at].id in self.inserted_ids \
-                and float(self.segments[at].start_time or 0.0) <= start:
+                and (float(self.segments[at].start_time or 0.0),
+                     self.insert_ranks.get(self.segments[at].id, 0.0)) <= (start, rank):
             at += 1
         seg = SpineSegment(
             id=corr["id"], index=self.segments[pos].index,
@@ -362,6 +391,7 @@ class SpineView:
         self.segments.insert(at, seg)
         self.inserted_ids.add(corr["id"])
         self.insert_labels[corr["id"]] = p.get("label")
+        self.insert_ranks[corr["id"]] = rank
         return at
 
     def split_local(self, index: int, left_text: str, split_s: float,
@@ -383,6 +413,25 @@ class SpineView:
         del self.segments[pos]
         self.inserted_ids.discard(insert_id)
         self.insert_labels.pop(insert_id, None)
+        self.insert_ranks.pop(insert_id, None)
+        return pos
+
+    def unsplit_local(self, insert_id: str) -> Optional[int]:
+        """Local echo of a chunk-split removal (UNSPLIT): the right half leaves
+        the walk and the split target gets its pre-split text and end back
+        (the snapshots the split's own payloads recorded). Post-split seam
+        nudges on the target survive as their own chain — a reload composes
+        the exact truth; this echo restores the split-time snapshot."""
+        info = self.split_groups.pop(insert_id, None)
+        pos = self.remove_insert_local(insert_id)
+        if info is None:
+            return pos
+        target = next((s for s in self.segments if s.id == info.get("target_id")), None)
+        if target is not None:
+            if info.get("old_text") is not None:
+                target.text = info["old_text"]
+            if info.get("old_end") is not None:
+                target.end_time = float(info["old_end"])
         return pos
 
     @property
@@ -660,7 +709,8 @@ def plan_chunk_insert(
     index: int,              # Cursor position (the insert lands in the seam AFTER it)
     weld_eps: float = 0.01,  # Point-cut weld threshold (seconds)
     inserted_ids: Optional[set] = None,  # Synthetic ids in the walked spine (anchor resolution)
-) -> Optional[Dict[str, Any]]:  # {"after_id","before_id","start_s","end_s","welded"}; None = refused
+    insert_ranks: Optional[Dict[str, float]] = None,  # Synthetic id -> stack rank (walked-order tie-break)
+) -> Optional[Dict[str, Any]]:  # {"after_id","before_id","start_s","end_s","welded","rank"}; None = refused
     """Plan a chunk insertion into the seam after the cursor (the i gesture unit; pure).
 
     Whole-gap by default — the de994164 missed-dispatch case is one keystroke.
@@ -672,15 +722,21 @@ def plan_chunk_insert(
     WALKED neighbors, but the ANCHORS resolve past synthetic chunks to the
     nearest LAYER-0 segments (a synthetic anchor would drop as foreign at
     projection placement) — so inhale · um · inhale STACK in one gap as
-    sibling inserts under a shared anchor, ordered by start_time (drive find,
-    session C.1). Refusals (None): cursor off the spine, missing audio times,
-    an OVERLAPPING boundary (negative gap beyond the weld eps — hear it with g
-    and nudge the overlap first), or no layer-0 segment anywhere left of the
-    seam (nothing to anchor).
+    sibling inserts under a shared anchor, ordered by (start_time, RANK,
+    created_at). The RANK carries the walked position when start_times tie
+    (FINDING 131ba57a: a split's right half sits AT the weld, so an isolation
+    insert made from the left half must order BEFORE it — creation order alone
+    can never say that): before a same-start walked right sibling = its rank
+    - 1, after a same-start walked left sibling = its rank + 1, between two =
+    the midpoint, no same-start sibling = 0. Refusals (None): cursor off the
+    spine, missing audio times, an OVERLAPPING boundary (negative gap beyond
+    the weld eps — hear it with g and nudge the overlap first), or no layer-0
+    segment anywhere left of the seam (nothing to anchor).
     """
     if not (0 <= index < len(segments)):
         return None
     synthetic = inserted_ids or set()
+    ranks = insert_ranks or {}
     left = segments[index]
     if left.start_time is None or left.end_time is None:
         return None
@@ -690,9 +746,27 @@ def plan_chunk_insert(
         return None
     l_end = float(left.end_time)
     right = segments[index + 1] if index + 1 < len(segments) else None
+
+    def _rank(start_s: float) -> float:
+        lo = hi = None
+        if left.id in synthetic and abs(float(left.start_time) - start_s) < weld_eps:
+            lo = float(ranks.get(left.id, 0.0))
+        if right is not None and right.id in synthetic \
+                and right.start_time is not None \
+                and abs(float(right.start_time) - start_s) < weld_eps:
+            hi = float(ranks.get(right.id, 0.0))
+        if lo is None and hi is None:
+            return 0.0
+        if lo is None:
+            return hi - 1.0
+        if hi is None:
+            return lo + 1.0
+        return (lo + hi) / 2.0
+
     if right is None:
         return {"after_id": after_id, "before_id": None,
-                "start_s": l_end, "end_s": l_end, "welded": True}
+                "start_s": l_end, "end_s": l_end, "welded": True,
+                "rank": _rank(l_end)}
     if right.start_time is None or right.end_time is None:
         return None
     before_id = next((segments[j].id for j in range(index + 1, len(segments))
@@ -702,9 +776,11 @@ def plan_chunk_insert(
         return None
     if gap < weld_eps:
         return {"after_id": after_id, "before_id": before_id,
-                "start_s": l_end, "end_s": l_end, "welded": True}
+                "start_s": l_end, "end_s": l_end, "welded": True,
+                "rank": _rank(l_end)}
     return {"after_id": after_id, "before_id": before_id,
-            "start_s": l_end, "end_s": float(right.start_time), "welded": False}
+            "start_s": l_end, "end_s": float(right.start_time), "welded": False,
+            "rank": _rank(l_end)}
 
 
 def parse_entity_input(

@@ -253,7 +253,7 @@ def test_plan_chunk_insert_gap_weld_tail_refusals():
     gapped = [seg("a", 0.0, 4.5), seg("b", 6.0, 9.0)]
     plan = plan_chunk_insert(gapped, 0)
     assert plan == {"after_id": "a", "before_id": "b",
-                    "start_s": 4.5, "end_s": 6.0, "welded": False}
+                    "start_s": 4.5, "end_s": 6.0, "welded": False, "rank": 0.0}
 
     # welded point cut: zero-width at the cut, nudges grow it over the bookends
     welded = [seg("a", 0.0, 5.0), seg("b", 5.0, 9.0)]
@@ -264,18 +264,30 @@ def test_plan_chunk_insert_gap_weld_tail_refusals():
     # spine tail: zero-width after the last segment, no right flank
     plan = plan_chunk_insert(gapped, 1)
     assert plan == {"after_id": "b", "before_id": None,
-                    "start_s": 9.0, "end_s": 9.0, "welded": True}
+                    "start_s": 9.0, "end_s": 9.0, "welded": True, "rank": 0.0}
 
     # anchors resolve past synthetics: inhale · um · inhale stack in ONE gap
     # (C.1 drive find — the after/before anchors must be LAYER-0 ids)
     stacked = [seg("a", 0.0, 4.5), seg("ins1", 4.5, 5.0), seg("b", 5.0, 9.0)]
     plan = plan_chunk_insert(stacked, 1, inserted_ids={"ins1"})
     assert plan == {"after_id": "a", "before_id": "b",
-                    "start_s": 5.0, "end_s": 5.0, "welded": True}
+                    "start_s": 5.0, "end_s": 5.0, "welded": True, "rank": 0.0}
     # the seam between the real cursor and a synthetic right neighbor works too
+    # — and the rank orders the new insert BEFORE the same-start sibling (the
+    # split-then-isolate case, FINDING 131ba57a: creation order never could)
     plan = plan_chunk_insert(stacked, 0, inserted_ids={"ins1"})
     assert plan["after_id"] == "a" and plan["before_id"] == "b"
     assert plan["welded"] and plan["start_s"] == 4.5
+    assert plan["rank"] == -1.0
+    # after a zero-width same-start left sibling: rank goes ABOVE it (a stack
+    # built left-to-right keeps arrival order); between two = the midpoint
+    zw = [seg("a", 0.0, 4.5), seg("z1", 4.5, 4.5), seg("ins1", 4.5, 5.0),
+          seg("b", 5.0, 9.0)]
+    plan = plan_chunk_insert(zw, 1, inserted_ids={"z1", "ins1"},
+                             insert_ranks={"z1": -1.0, "ins1": 0.0})
+    assert plan["rank"] == -0.5
+    plan = plan_chunk_insert(zw, 1, inserted_ids={"z1"}, insert_ranks={"z1": -1.0})
+    assert plan["rank"] == 0.0
     # no layer-0 segment left of the seam: nothing to anchor
     assert plan_chunk_insert([seg("ins1", 0.0, 1.0)], 0,
                              inserted_ids={"ins1"}) is None
@@ -302,6 +314,7 @@ def test_spineview_insert_echo_bookkeeping():
                                   start_time=6.0, end_time=9.0)]
     view.inserted_ids = set()
     view.insert_labels = {}
+    view.insert_ranks = {}
 
     pos = view.add_insert_local(
         {"id": "ins1", "payload": {"operation": "chunk_insert",
@@ -458,6 +471,7 @@ def test_spineview_split_echo():
                                   start_time=6.0, end_time=9.0)]
     view.inserted_ids = set()
     view.insert_labels = {}
+    view.insert_ranks = {}
 
     pos = view.split_local(0, "alpha", 2.0,
                            {"id": "sp1", "payload": {"operation": "chunk_insert",
@@ -484,3 +498,55 @@ def test_spineview_split_echo():
     assert [(s.text, s.start_time, s.end_time) for s in view.segments] == [
         ("alpha", 0.0, 2.0), ("beta", 2.0, 4.0), ("gamma", 4.0, 6.0),
         ("tail", 6.0, 9.0)]
+
+
+def test_spineview_rank_echo_and_unsplit():
+    """131ba57a echoes (hermetic): (a) a rank -1 insert lands BETWEEN a split's
+    halves even though the right half echoed first; (b) unsplit_local removes
+    the right half AND restores the target's pre-split text/end from the
+    registered group snapshot."""
+    from cjm_transcript_correction_core.models import SpineSegment
+
+    view = SpineView.__new__(SpineView)
+    view.segments = [SpineSegment(id="a", index=0, text="alpha beta gamma",
+                                  start_time=0.0, end_time=6.0),
+                     SpineSegment(id="b", index=1, text="tail",
+                                  start_time=6.0, end_time=9.0)]
+    view.inserted_ids = set()
+    view.insert_labels = {}
+    view.insert_ranks = {}
+    view.split_groups = {}
+
+    # split echo (right half at the weld), then the user's inhale insert from
+    # the LEFT half: rank -1 overtakes the same-start sibling
+    assert view.split_local(0, "alpha", 2.0,
+                            {"id": "sp1", "payload": {"operation": "chunk_insert",
+                                                      "after_segment_id": "a",
+                                                      "start_time": 2.0,
+                                                      "end_time": 6.0,
+                                                      "text": "beta gamma"}}) == 1
+    view.split_groups["sp1"] = {"group_ids": ["t1", "n1"], "target_id": "a",
+                                "old_text": "alpha beta gamma", "old_end": 6.0}
+    pos = view.add_insert_local(
+        {"id": "inh", "payload": {"operation": "chunk_insert",
+                                  "after_segment_id": "a", "start_time": 2.0,
+                                  "end_time": 2.0, "label": "inhale",
+                                  "text": "", "rank": -1.0}})
+    assert pos == 1
+    assert [s.id for s in view.segments] == ["a", "inh", "sp1", "b"]
+    # rank 0 (absent) still lands after the same-start sibling stack
+    pos = view.add_insert_local(
+        {"id": "um", "payload": {"operation": "chunk_insert",
+                                 "after_segment_id": "a", "start_time": 2.0,
+                                 "end_time": 2.0, "text": ""}})
+    assert pos == 3
+    assert [s.id for s in view.segments] == ["a", "inh", "sp1", "um", "b"]
+    assert view.remove_insert_local("um") == 3
+    assert view.remove_insert_local("inh") == 1
+
+    # unsplit: right half leaves, the target gets its pre-split text/end back
+    assert view.unsplit_local("sp1") == 1
+    assert [s.id for s in view.segments] == ["a", "b"]
+    assert (view.segments[0].text, view.segments[0].end_time) == \
+        ("alpha beta gamma", 6.0)
+    assert view.split_groups == {} and view.insert_ranks == {}
