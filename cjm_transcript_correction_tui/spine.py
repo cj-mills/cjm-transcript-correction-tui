@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from cjm_capability_primitives.speaker_diarization import load_turns_artifact
 from cjm_context_graph_layer.grammar import OverlayRelations, SpineRelations
 from cjm_context_graph_layer.ops import graph_task
 from cjm_context_graph_primitives.query import NodeQuery, OrderBy, RelationPredicate
@@ -18,6 +20,7 @@ from cjm_transcript_correction_core.graph import (active_corrections, active_spe
                                                   project_effective_spine,
                                                   resolve_source_renditions)
 from cjm_transcript_correction_core.models import SpineSegment
+from cjm_transcript_correction_core.signals import speaker_turn_proposals
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
 
 
@@ -64,6 +67,9 @@ class SpineView:
         self.inserted_ids: set = set()               # Synthetic chunk-insert segment ids (⊕ paint + gesture routing)
         self.insert_labels: Dict[str, Optional[str]] = {}  # insert id -> annotation label
         self.speakers: Dict[str, Dict[str, Any]] = {}  # segment id -> active speaker assignment (DEC d6df3a8e)
+        self.turn_proposals: Dict[str, Dict[str, Any]] = {}  # segment id -> {"cluster","overlap","coverage"} (diarization overlay; {} = no turns artifact)
+        self.turns_meta: Dict[str, Any] = {}          # Turns-artifact provenance (capability + metadata) — status strip + accept-op snapshots
+        self.cluster_entities: Dict[str, str] = {}    # cluster label -> Entity id (cluster-name-once memory, derived from ACTIVE accepts)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
         self.source_path: Optional[str] = None       # Original source media path (Source.path; the g/G seam decode target)
@@ -176,7 +182,29 @@ class SpineView:
         src = await graph_task(self.queue, self.graph_id, "get_node",
                                node_id=self.source_id)
         src = src.to_dict() if hasattr(src, "to_dict") else (src or {})
-        self.source_path = str((src.get("properties") or {}).get("path") or "") or None
+        props = src.get("properties") or {}
+        self.source_path = str(props.get("path") or "") or None
+        # Diarization turns overlay (DEC 0cae6b36): workspace root + the
+        # Source's content hash name the source-keyed artifact; no artifact =
+        # no proposals (the assign lane paints ∅ and the walk stays manual).
+        ws_root = os.environ.get("CJM_WORKSPACE")
+        # The hash lives on the Source's provenance SourceRef (node identity
+        # input), not in properties — read it from the sources list.
+        refs = src.get("sources") or []
+        chash = str(((refs[0] or {}).get("content_hash") if refs else "") or "")
+        if ws_root and chash:
+            artifact = load_turns_artifact(ws_root, chash)
+            if artifact:
+                self.turns_meta = {"capability": artifact.get("capability") or {},
+                                   "metadata": artifact.get("metadata") or {}}
+                self.turn_proposals = speaker_turn_proposals(
+                    self.segments, artifact.get("turns") or [])
+        # cluster-name-once memory: prior accepts journaled their cluster in
+        # the proposal snapshot; the projection carries it back (8a4df244).
+        self.cluster_entities = {
+            str(sp["cluster"]): str(sp["entity_id"])
+            for sp in self.speakers.values()
+            if sp.get("cluster") and sp.get("entity_id")}
 
     @property
     def size(self) -> int:  # Total segments in the effective spine
@@ -276,11 +304,18 @@ class SpineView:
             if (m.get("payload") or {}).get("mark_class")})
 
     def assign_local(self, segment_ids: List[str], entity_id: str,
-                     verdict: str, correction_id: str) -> None:
-        """Local echo of a committed speaker assignment (latest-wins per segment)."""
+                     verdict: str, correction_id: str,
+                     cluster: Optional[str] = None) -> None:
+        """Local echo of a committed speaker assignment (latest-wins per segment).
+
+        `cluster` rides accept/cluster-merge echoes so the cluster-name-once
+        memory updates without a reload (the projection carries it after)."""
         for sid in segment_ids:
             self.speakers[str(sid)] = {"entity_id": entity_id, "verdict": verdict,
-                                       "correction_id": correction_id}
+                                       "correction_id": correction_id,
+                                       "cluster": cluster}
+        if cluster:
+            self.cluster_entities[str(cluster)] = str(entity_id)
 
     def marks_for(self, segment_id: str) -> List[dict]:
         """The open marks anchored to a segment (oldest first) — dismissal targets."""

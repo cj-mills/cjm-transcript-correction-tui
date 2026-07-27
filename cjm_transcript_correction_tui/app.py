@@ -60,9 +60,10 @@ class CorrectionApp(App):
     # are inert in the walk lane. One data table, one check_action gate.
     ASSIGN_LANE_ACTIONS = frozenset({
         "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
-        "yank", "assign_pick", "assign_same", "assign_new", "cycle_lane",
-        "cancel", "quit_app"})
-    ASSIGN_ONLY_ACTIONS = frozenset({"assign_pick", "assign_same", "assign_new"})
+        "yank", "assign_pick", "assign_same", "assign_new", "assign_accept",
+        "cycle_lane", "cancel", "quit_app"})
+    ASSIGN_ONLY_ACTIONS = frozenset({"assign_pick", "assign_same", "assign_new",
+                                     "assign_accept"})
 
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
@@ -98,6 +99,7 @@ class CorrectionApp(App):
         Binding("tab", "cycle_lane", "lane", show=False, priority=True),
         Binding("space", "assign_same", "same speaker", show=False),
         Binding("A", "assign_new", "new speaker", show=False),
+        Binding("a", "assign_accept", "accept cluster", show=False),
         Binding("1", "assign_pick(1)", show=False), Binding("2", "assign_pick(2)", show=False),
         Binding("3", "assign_pick(3)", show=False), Binding("4", "assign_pick(4)", show=False),
         Binding("5", "assign_pick(5)", show=False), Binding("6", "assign_pick(6)", show=False),
@@ -162,6 +164,7 @@ class CorrectionApp(App):
         self._lane_arg = lane              # explicit --lane (wins over the sidecar; None = defer)
         self._entities: List[Dict[str, Any]] = []  # speaker Entity registry (graph-side, source-spanning)
         self._active_entity: Optional[str] = None  # entity id space assigns ("same speaker continues")
+        self._accept_cluster: Optional[str] = None  # cluster awaiting its name (the a-gesture's editor hop; None = no accept pending)
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
         self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
@@ -318,10 +321,18 @@ class CorrectionApp(App):
             body = Text("(empty)", style="dim")
         if self.lane == "assign":
             # Attribution chip: the assign lane's object of attention rides the
-            # text lane (gutter width stays source-stable). ∅ = unassigned.
+            # text lane (gutter width stays source-stable). ∅ = unassigned;
+            # an unassigned segment with a diarization proposal paints the
+            # cluster chip (?S00-style, per-cluster tint) — what `a` accepts.
             sp = view.speakers.get(seg.id)
-            chip = (Text(f"{self._entity_name(sp['entity_id'])[:14]} ▏", style="magenta")
-                    if sp else Text("∅ ▏", style="dim"))
+            prop = view.turn_proposals.get(seg.id)
+            if sp:
+                chip = Text(f"{self._entity_name(sp['entity_id'])[:14]} ▏", style="magenta")
+            elif prop:
+                chip = Text(f"?{str(prop['cluster']).replace('SPEAKER_', 'S')} ▏",
+                            style=self._cluster_style(str(prop["cluster"])))
+            else:
+                chip = Text("∅ ▏", style="dim")
             chip.append_text(body)
             body = chip
         if abs(pos - self.cursor) > 1 and seg.text:
@@ -413,9 +424,13 @@ class CorrectionApp(App):
             assigned = sum(1 for s in view.segments if s.id in view.speakers)
             active = (self._entity_name(self._active_entity)
                       if self._active_entity else "none")
-            return (f"{head}  ·  assigned {assigned}/{view.size}"
+            meta = view.turns_meta.get("metadata") or {}
+            turns = (f"  ·  turns {len(view.turn_proposals)}/{view.size}"
+                     f" · {meta.get('speaker_count', '?')}spk"
+                     if view.turn_proposals else "  ·  no turns")
+            return (f"{head}  ·  assigned {assigned}/{view.size}{turns}"
                     f"  ·  speaker: {active}{tail}"
-                    f"  ·  1-9 pick · space same · A new · j/k walk · r replay"
+                    f"  ·  a accept · 1-9 pick · space same · A new · j/k walk · r replay"
                     f" · g/G seam · \\[/] speed · y copy · tab walk-lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
         return (f"{head}  ·  edited {edited}{tail}"
@@ -845,6 +860,17 @@ class CorrectionApp(App):
                 return f"?{nm}" if p.get("provisional") else nm
         return str(entity_id or "")[:8]
 
+    _CLUSTER_TINTS = ("cyan", "green", "yellow", "blue", "bright_magenta", "bright_red")
+
+    def _cluster_style(self, cluster: str) -> str:
+        """Stable per-cluster tint (dim — a proposal reads quieter than an
+        assignment's magenta): index by sorted cluster label within this
+        source's proposals; labels are result-scoped so stability only needs
+        to hold per open."""
+        clusters = sorted({str(p.get("cluster")) for p in self.view.turn_proposals.values()})
+        idx = clusters.index(cluster) if cluster in clusters else 0
+        return f"dim {self._CLUSTER_TINTS[idx % len(self._CLUSTER_TINTS)]}"
+
     def _assign_menu(self) -> List[Tuple[str, str]]:
         """The layered digit menu (DEC 4ec6a49c): THIS source's assigned
         speakers first (spine encounter order), then the rest of the registry
@@ -877,6 +903,74 @@ class CorrectionApp(App):
                 "assign: no active speaker — pick 1-9 or A new")
             return
         await self._commit_assign(self._active_entity)
+
+    async def action_assign_accept(self) -> None:
+        """a (assign lane): ACCEPT the cursor segment's proposed cluster — the
+        BULK cluster-name-once op (DEC 8a4df244): one keystroke assigns the
+        bound entity to EVERY unassigned segment this cluster dominates; the
+        digit/space vocabulary stays the per-segment correction layer over it.
+        An unbound cluster hops through the speaker editor first (digit pick /
+        Name / ?handle — the A vocabulary); accepting a second cluster onto an
+        already-bound entity records verdict=cluster-merge (embeddings split
+        one physical voice — prime flywheel supervision, DEC d6df3a8e)."""
+        seg = self.view.segments[self.cursor]
+        prop = self.view.turn_proposals.get(seg.id)
+        if not prop:
+            self.query_one("#status", Static).update(
+                "accept: no diarization proposal on this segment")
+            return
+        cluster = str(prop["cluster"])
+        entity = self.view.cluster_entities.get(cluster)
+        if entity:
+            await self._commit_accept(cluster, entity)
+            return
+        self._accept_cluster = cluster
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "assign"
+        editor.value = ""
+        editor.display = True
+        editor.focus()
+        menu = self._assign_menu()
+        listing = " · ".join(f"{i + 1}:{nm}" for i, (_, nm) in enumerate(menu))
+        self.query_one("#status", Static).update(
+            f'accept {cluster}: #-or-Name · "? handle" = provisional'
+            + (f" · {listing}" if listing else ""))
+
+    async def _commit_accept(self, cluster: str, entity_id: str) -> None:
+        """One bulk speaker_assign over every UNASSIGNED segment the cluster
+        dominates — assigned segments keep their per-segment judgments (the
+        latest-wins correction layer is never clobbered by a later accept).
+        Verdict: accept for a fresh cluster binding, cluster-merge when the
+        entity already carries a DIFFERENT cluster."""
+        targets = [s.id for s in self.view.segments
+                   if s.id not in self.view.speakers
+                   and str((self.view.turn_proposals.get(s.id) or {}).get("cluster")) == cluster]
+        if not targets:
+            self.query_one("#status", Static).update(
+                f"accept: no unassigned segments under {cluster}")
+            return
+        merged = entity_id in {e for c, e in self.view.cluster_entities.items()
+                               if c != cluster}
+        verdict = "cluster-merge" if merged else "accept"
+        cov = [float((self.view.turn_proposals.get(t) or {}).get("coverage") or 0.0)
+               for t in targets]
+        cap = self.view.turns_meta.get("capability") or {}
+        meta = self.view.turns_meta.get("metadata") or {}
+        proposal = {"cluster": cluster,
+                    "model_id": meta.get("model_id"),
+                    "config_hash": cap.get("config_hash"),
+                    "segments": len(targets),
+                    "mean_coverage": round(sum(cov) / len(cov), 3) if cov else None}
+        corr_id = await commit_speaker_assign_correction(
+            self.view.queue, self.view.graph_id, self.view.source_id,
+            targets, entity_id, self.session_id, verdict=verdict,
+            proposal=proposal, actor=self.actor, journal_path=self._journal_path)
+        self.view.assign_local(targets, entity_id, verdict, corr_id, cluster=cluster)
+        self._active_entity = entity_id
+        self._render()
+        self.query_one("#status", Static).update(
+            f"{verdict}: {cluster} → {self._entity_name(entity_id)}"
+            f" ({len(targets)} segments)")
 
     def action_assign_new(self) -> None:
         """A: the speaker editor — a bare digit picks from the numbered menu
@@ -938,6 +1032,12 @@ class CorrectionApp(App):
         activate when diarization proposals exist, DEC 8a4df244); reassignment
         needs no supersede: the projection is latest-wins per segment, the
         re-decision CHAIN is the record (the nudge precedent)."""
+        if self._accept_cluster is not None:
+            # The a-gesture's editor hop lands here: the picked/minted entity
+            # names the PENDING CLUSTER (bulk), not just the cursor segment.
+            cluster, self._accept_cluster = self._accept_cluster, None
+            await self._commit_accept(cluster, entity_id)
+            return
         seg = self.view.segments[self.cursor]
         corr_id = await commit_speaker_assign_correction(
             self.view.queue, self.view.graph_id, self.view.source_id,
@@ -1309,6 +1409,7 @@ class CorrectionApp(App):
     def action_cancel(self) -> None:
         editor = self.query_one("#editor", Input)
         if editor.display:
+            self._accept_cluster = None  # an aborted a-gesture must not hijack the next assign
             self._close_editor()
             self._render()
         else:
