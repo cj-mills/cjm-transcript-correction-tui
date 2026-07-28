@@ -70,6 +70,7 @@ class SpineView:
         self.split_groups: Dict[str, Dict[str, Any]] = {}  # right-half insert id -> its split group (the x-unsplit target)
         self.speakers: Dict[str, Dict[str, Any]] = {}  # segment id -> active speaker assignment (DEC d6df3a8e)
         self.turn_proposals: Dict[str, Dict[str, Any]] = {}  # segment id -> {"cluster","overlap","coverage"} (diarization overlay; {} = no turns artifact)
+        self._turns: List[Dict[str, Any]] = []        # Raw diarization turns (retained for id-scoped proposal refresh)
         self.turns_meta: Dict[str, Any] = {}          # Turns-artifact provenance (capability + metadata) — status strip + accept-op snapshots
         self.cluster_entities: Dict[str, str] = {}    # cluster label -> Entity id (cluster-name-once memory, derived from ACTIVE accepts)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
@@ -221,8 +222,8 @@ class SpineView:
             if artifact:
                 self.turns_meta = {"capability": artifact.get("capability") or {},
                                    "metadata": artifact.get("metadata") or {}}
-                self.turn_proposals = speaker_turn_proposals(
-                    self.segments, artifact.get("turns") or [])
+                self._turns = artifact.get("turns") or []
+                self.turn_proposals = speaker_turn_proposals(self.segments, self._turns)
         # cluster-name-once memory: prior accepts journaled their cluster in
         # the proposal snapshot; the projection carries it back (8a4df244).
         self.cluster_entities = {
@@ -405,16 +406,40 @@ class SpineView:
         self.insert_ranks[corr["id"]] = rank
         return at
 
+    def refresh_turn_proposal(self, segment_id: str) -> None:
+        """Recompute ONE segment's diarization proposal (id-scoped, cheap).
+
+        The load-time map cannot know segments minted or re-texted mid-session
+        (drive find 2026-07-27: split halves showed ∅ until a restart) — the
+        echoes call this so text-bearing synthetics propose immediately, and
+        an emptied/removed segment drops its stale chip. No-op without turns."""
+        if not self._turns:
+            return
+        seg = next((s for s in self.segments if s.id == segment_id), None)
+        if seg is None:
+            self.turn_proposals.pop(segment_id, None)
+            return
+        prop = speaker_turn_proposals([seg], self._turns).get(segment_id)
+        if prop:
+            self.turn_proposals[segment_id] = prop
+        else:
+            self.turn_proposals.pop(segment_id, None)
+
     def split_local(self, index: int, left_text: str, split_s: float,
                     corr: dict) -> Optional[int]:
         """Local echo of a committed chunk split: the target keeps the LEFT
         half (text truncated, end pulled to the cut), and the right half
         splices as a synthetic sibling via the insert echo — the same
-        placement a projection reload would produce (welded at split_s)."""
+        placement a projection reload would produce (welded at split_s).
+        Both halves refresh their diarization proposals (times and texts
+        changed; the right half is text-bearing and proposes immediately)."""
         seg = self.segments[index]
         seg.text = left_text
         seg.end_time = split_s
-        return self.add_insert_local(corr)
+        at = self.add_insert_local(corr)
+        self.refresh_turn_proposal(seg.id)
+        self.refresh_turn_proposal(corr["id"])
+        return at
 
     def remove_insert_local(self, insert_id: str) -> Optional[int]:
         """Local echo of a chunk-insert removal; returns the vacated position."""
@@ -425,6 +450,7 @@ class SpineView:
         self.inserted_ids.discard(insert_id)
         self.insert_labels.pop(insert_id, None)
         self.insert_ranks.pop(insert_id, None)
+        self.turn_proposals.pop(insert_id, None)
         return pos
 
     def unsplit_local(self, insert_id: str) -> Optional[int]:
@@ -443,6 +469,7 @@ class SpineView:
                 target.text = info["old_text"]
             if info.get("old_end") is not None:
                 target.end_time = float(info["old_end"])
+            self.refresh_turn_proposal(target.id)
         return pos
 
     @property

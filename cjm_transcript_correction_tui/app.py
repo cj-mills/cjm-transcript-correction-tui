@@ -813,6 +813,10 @@ class CorrectionApp(App):
                 journal_path=self._journal_path)
             seg.text = new_text          # local echo of the new effective text
             self._marks[self.cursor] = "corrected"
+            # Text arriving/leaving changes proposal eligibility (empty chunks
+            # never propose): a missed-speech insert gains its cluster chip the
+            # moment its words land, an emptied chunk drops it.
+            self.view.refresh_turn_proposal(seg.id)
         # A text-bearing PRUNED position must leave the prune set (the same
         # rescue as boundary shifts): the prune otherwise drops the position —
         # WITH its restored text — from the downstream effective view. Fires

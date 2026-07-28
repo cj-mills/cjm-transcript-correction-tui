@@ -315,6 +315,7 @@ def test_spineview_insert_echo_bookkeeping():
     view.inserted_ids = set()
     view.insert_labels = {}
     view.insert_ranks = {}
+    view.turn_proposals = {}
 
     pos = view.add_insert_local(
         {"id": "ins1", "payload": {"operation": "chunk_insert",
@@ -472,6 +473,8 @@ def test_spineview_split_echo():
     view.inserted_ids = set()
     view.insert_labels = {}
     view.insert_ranks = {}
+    view.turn_proposals = {}
+    view._turns = []
 
     pos = view.split_local(0, "alpha", 2.0,
                            {"id": "sp1", "payload": {"operation": "chunk_insert",
@@ -516,6 +519,8 @@ def test_spineview_rank_echo_and_unsplit():
     view.insert_labels = {}
     view.insert_ranks = {}
     view.split_groups = {}
+    view.turn_proposals = {}
+    view._turns = []
 
     # split echo (right half at the weld), then the user's inhale insert from
     # the LEFT half: rank -1 overtakes the same-start sibling
@@ -579,3 +584,53 @@ def test_aseg_index_synthetics_inherit_their_anchor_side():
                                          start_time=0.0, end_time=0.0))
     view.inserted_ids.add("head")
     assert view.aseg_index(0) == 0
+
+
+def test_split_halves_get_turn_proposals_mid_session():
+    """Drive find 2026-07-27 (assign lane at ~760s): proposals were a LOAD-time
+    map, so mid-session split halves painted ∅ until a restart. The echoes now
+    refresh id-scoped: text-bearing halves propose immediately, empty inserts
+    never do (text = the unit of attribution supervision), and removal drops
+    the stale chip."""
+    from cjm_transcript_correction_core.models import SpineSegment
+    from cjm_transcript_correction_core.signals import speaker_turn_proposals
+
+    view = SpineView.__new__(SpineView)
+    view.segments = [SpineSegment(id="a", index=0, text="alpha beta gamma",
+                                  start_time=0.0, end_time=6.0),
+                     SpineSegment(id="b", index=1, text="tail",
+                                  start_time=6.0, end_time=9.0)]
+    view.inserted_ids = set()
+    view.insert_labels = {}
+    view.insert_ranks = {}
+    view.split_groups = {}
+    view._turns = [{"start": 0.0, "end": 3.5, "speaker": "SPEAKER_00"},
+                   {"start": 3.5, "end": 9.0, "speaker": "SPEAKER_01"}]
+    view.turn_proposals = speaker_turn_proposals(view.segments, view._turns)
+    assert view.turn_proposals["a"]["cluster"] == "SPEAKER_00"
+
+    # split at 2.0: both halves re-propose — the left keeps S00, the right
+    # (2.0-6.0, text-bearing) proposes S01 immediately, no restart needed
+    view.split_local(0, "alpha", 2.0,
+                     {"id": "sp1", "payload": {"operation": "chunk_insert",
+                                               "after_segment_id": "a",
+                                               "start_time": 2.0, "end_time": 6.0,
+                                               "text": "beta gamma"}})
+    assert view.turn_proposals["a"]["cluster"] == "SPEAKER_00"
+    assert view.turn_proposals["sp1"]["cluster"] == "SPEAKER_01"
+
+    # an EMPTY insert at the weld never proposes, even under full coverage
+    view.add_insert_local({"id": "inh", "payload": {"operation": "chunk_insert",
+                                                    "after_segment_id": "a",
+                                                    "start_time": 2.0, "end_time": 2.3,
+                                                    "label": "inhale", "text": "",
+                                                    "rank": -1.0}})
+    view.refresh_turn_proposal("inh")
+    assert "inh" not in view.turn_proposals
+    # text landing later (the e-edit lane) flips eligibility on refresh
+    view.segments[1].text = "recovered words"
+    view.refresh_turn_proposal("inh")
+    assert view.turn_proposals["inh"]["cluster"] == "SPEAKER_00"
+    # removal drops the chip with the row
+    assert view.remove_insert_local("inh") == 1
+    assert "inh" not in view.turn_proposals
