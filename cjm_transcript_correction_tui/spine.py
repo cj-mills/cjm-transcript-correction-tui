@@ -243,10 +243,21 @@ class SpineView:
         return self.segments[start:start + count]
 
     def aseg_index(self, index: int) -> Optional[int]:
-        """Which coarse AudioSegment (by position) a segment sits in — seam rendering."""
+        """Which coarse AudioSegment (by position) a segment sits in — seam rendering.
+
+        SYNTHETIC chunks inherit the attribution of the layer-0 segment they
+        FOLLOW (their anchor side): coarse seams are often cut flush with the
+        last chunk's end, so a bookend insert born AT that time would bisect
+        into the NEXT audio segment and paint under its banner (drive find
+        2026-07-27 — the aseg-1 inhale bookend appeared to open aseg 2). No
+        layer-0 segment to the left = fall through to the time bisect."""
         if not (0 <= index < len(self.segments)) or not self._aseg_starts:
             return None
         seg = self.segments[index]
+        if seg.id in self.inserted_ids:
+            for j in range(index - 1, -1, -1):
+                if self.segments[j].id not in self.inserted_ids:
+                    return self.aseg_index(j)
         if seg.start_time is None:
             return None
         return max(0, bisect_right(self._aseg_starts, float(seg.start_time)) - 1)

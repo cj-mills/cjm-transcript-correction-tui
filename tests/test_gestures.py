@@ -550,3 +550,32 @@ def test_spineview_rank_echo_and_unsplit():
     assert (view.segments[0].text, view.segments[0].end_time) == \
         ("alpha beta gamma", 6.0)
     assert view.split_groups == {} and view.insert_ranks == {}
+
+
+def test_aseg_index_synthetics_inherit_their_anchor_side():
+    """Drive find 2026-07-27: coarse seams often cut flush with the last
+    chunk's end, so a bookend insert born AT the seam time would time-bisect
+    into the NEXT audio segment and paint under its banner. Synthetic chunks
+    inherit the aseg of the layer-0 segment they follow; layer-0 attribution
+    stays a pure time bisect."""
+    from cjm_transcript_correction_core.models import SpineSegment
+
+    view = SpineView.__new__(SpineView)
+    view._aseg_starts = [0.0, 100.0]
+    view.segments = [
+        SpineSegment(id="a", index=0, text="last of aseg 1",
+                     start_time=90.0, end_time=100.0),
+        SpineSegment(id="inh", index=0, text="",       # bookend insert AT the seam
+                     start_time=100.0, end_time=100.0),
+        SpineSegment(id="b", index=1, text="first of aseg 2",
+                     start_time=100.4, end_time=105.0),
+    ]
+    view.inserted_ids = {"inh"}
+    assert view.aseg_index(0) == 0
+    assert view.aseg_index(1) == 0    # inherited from "a", NOT bisected into aseg 2
+    assert view.aseg_index(2) == 1    # the banner moves to the layer-0 opener
+    # a synthetic with no layer-0 left neighbor falls back to the time bisect
+    view.segments.insert(0, SpineSegment(id="head", index=0, text="",
+                                         start_time=0.0, end_time=0.0))
+    view.inserted_ids.add("head")
+    assert view.aseg_index(0) == 0
