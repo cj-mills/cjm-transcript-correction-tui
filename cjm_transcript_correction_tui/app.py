@@ -12,8 +12,8 @@ from cjm_transcript_correction_core.graph import (commit_boundary_shift_correcti
                                                   commit_chunk_insert_removal,
                                                   commit_chunk_split_correction,
                                                   commit_chunk_split_removal,
-                                                  commit_mark_correction, commit_mark_dismissal,
-                                                  commit_prune_amendment,
+                                                  commit_extraction_gate, commit_mark_correction,
+                                                  commit_mark_dismissal, commit_prune_amendment,
                                                   commit_speaker_assign_correction,
                                                   commit_speaker_entity, commit_text_correction,
                                                   commit_time_nudge_correction, LEGACY_SKELETON,
@@ -28,7 +28,7 @@ from textual.widgets import Input, Static
 
 from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_entity_input,
                     parse_mark_input, plan_boundary_shift, plan_chunk_insert, plan_chunk_split,
-                    plan_time_nudge, resolve_mark_class_token, source_status, SpineView)
+                    plan_gate, plan_time_nudge, resolve_mark_class_token, source_status, SpineView)
 
 
 class CorrectionApp(App):
@@ -115,6 +115,7 @@ class CorrectionApp(App):
         Binding("N", "prev_mark", "prev mark"),
         Binding("p", "next_prune", "next prune"),
         Binding("P", "prev_prune", "prev prune"),
+        Binding("F", "gate_editor", "flywheel gate", show=False),
         Binding("enter", "open_source", "open", show=False),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
@@ -422,6 +423,9 @@ class CorrectionApp(App):
                        else f" \\[{self.purpose.upper()}]")
         head = (f"{badges}  {view.source_title}"
                 f"  ·  segment {self.cursor + 1}/{view.size}")
+        chip = self._gate_chip()
+        if chip:
+            head += f"  ·  {chip}"
         tail = f"  ·  ×{self.speed:g}  ·  session {str(self.session_id or '')[:8]}"
         if self.lane == "assign":
             assigned = sum(1 for s in view.segments if s.id in view.speakers)
@@ -439,7 +443,7 @@ class CorrectionApp(App):
         return (f"{head}  ·  edited {edited}{tail}"
                 f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
                 f" · {{}} step · \\[/] speed · e edit · y copy · i/I ⊕insert · x ⊖remove"
-                f" · m/b/M ⚑mark · n/N⚑ p/P✂ jump · tab assign-lane · q quit")
+                f" · m/b/M ⚑mark · n/N⚑ p/P✂ jump · F gate · tab assign-lane · q quit")
 
     def _render_picker(self) -> None:
         """The 2ce81638 discovery stage: the graph's Sources with correction
@@ -802,6 +806,9 @@ class CorrectionApp(App):
             return
         if self._input_mode == "split":
             await self._submit_split(event.value, event.input.cursor_position)
+            return
+        if self._input_mode == "gate":
+            await self._submit_gate(event.value)
             return
         seg = self.view.segments[self.cursor]
         new_text = event.value
@@ -1504,6 +1511,67 @@ class CorrectionApp(App):
         suffix = f" — {note}" if note else ""
         self.query_one("#status", Static).update(
             f"⚑ #{seg.index} [{mark_class}] ({anchor['kind']}){suffix}")
+
+    def action_gate_editor(self) -> None:
+        """F: the extraction-gate editor (DEC 8e05b87b, flywheel build leg 1) —
+        `w [sec]` watermarks the pause point (pre-filled with the cursor
+        segment's end: pausing a pass = F, enter), `signoff` = signed_off with
+        the watermark at end-of-source, `exclude`/`resume` flip the status.
+        Every submit is one journaled append-only assertion on THIS spine."""
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "gate"
+        seg = self.view.segments[self.cursor]
+        editor.value = (f"w {float(seg.end_time):.1f}"
+                        if seg.end_time is not None else "w ")
+        editor.display = True
+        editor.focus()
+        self.query_one("#status", Static).update(
+            "gate: w [sec] watermark-at-pause · signoff · exclude · resume"
+            + f" · now: {self._gate_chip() or 'in_progress (default), no watermark'}")
+
+    def _gate_chip(self) -> str:
+        """The status-strip gate chip: empty when never asserted (the quiet
+        in_progress default), else status glyph + watermark seconds."""
+        gate = self.view.gate if self.view is not None else None
+        if not gate:
+            return ""
+        glyph = {"in_progress": "▶", "signed_off": "✔", "excluded": "✘"}.get(
+            str(gate.get("extraction_status")), "?")
+        wm = gate.get("annotated_through")
+        return f"gate {glyph}{f'{float(wm):.1f}s' if wm is not None else ''}"
+
+    async def _submit_gate(self, raw: str) -> None:
+        """The F-editor submission: plan (pure) + commit ONE gate assertion +
+        local echo. The watermark is asserted EXPLICITLY — never derived from
+        op positions (DEC 8e05b87b: derivation underestimates under op-free
+        paging)."""
+        self._close_editor()
+        view = self.view
+        status = self.query_one("#status", Static)
+        ends = [float(s.end_time) for s in view.segments if s.end_time is not None]
+        seg = view.segments[self.cursor]
+        plan = plan_gate(raw,
+                         float(seg.end_time) if seg.end_time is not None else None,
+                         max(ends) if ends else None,
+                         (view.gate or {}).get("annotated_through"))
+        if plan is None:
+            self._render()
+            status.update("gate: w [sec] · signoff · exclude · resume "
+                          "(refused — unknown verb or no time to anchor)")
+            return
+        new_status, watermark = plan
+        gate_id = await commit_extraction_gate(
+            view.queue, view.graph_id, view.source_id, view.skeleton_hash,
+            new_status, watermark, session_id=self.session_id,
+            actor=self.actor, journal_path=self._journal_path)
+        view.set_gate_local({"id": gate_id, "source_id": view.source_id,
+                             "skeleton_hash": view.skeleton_hash,
+                             "extraction_status": new_status,
+                             "annotated_through": watermark,
+                             "actor": self.actor, "created_at": time.time()})
+        self._render()
+        wm_txt = f"{float(watermark):.1f}s" if watermark is not None else "none"
+        status.update(f"⛭ gate asserted: {new_status} · annotated_through {wm_txt}")
 
     def action_cancel(self) -> None:
         editor = self.query_one("#editor", Input)

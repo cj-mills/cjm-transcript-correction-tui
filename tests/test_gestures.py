@@ -634,3 +634,20 @@ def test_split_halves_get_turn_proposals_mid_session():
     # removal drops the chip with the row
     assert view.remove_insert_local("inh") == 1
     assert "inh" not in view.turn_proposals
+
+
+def test_plan_gate_grammar():
+    """The F gesture unit (DEC 8e05b87b): w = watermark at the pause point,
+    signoff = end-of-source, exclude/resume keep the watermark, junk refuses."""
+    from cjm_transcript_correction_tui.spine import plan_gate
+
+    assert plan_gate("w", 2016.2, 2500.0, None) == ("in_progress", 2016.2)
+    assert plan_gate("w 100.5", None, 2500.0, None) == ("in_progress", 100.5)  # explicit override needs no cursor time
+    assert plan_gate("signoff", 2016.2, 2500.0, 2016.2) == ("signed_off", 2500.0)
+    assert plan_gate("exclude", 2016.2, 2500.0, 2016.2) == ("excluded", 2016.2)
+    assert plan_gate("resume", None, None, 2016.2) == ("in_progress", 2016.2)
+    assert plan_gate("", 1.0, 2.0, None) is None            # empty
+    assert plan_gate("done", 1.0, 2.0, None) is None        # unknown verb
+    assert plan_gate("w abc", 1.0, 2.0, None) is None       # non-numeric override
+    assert plan_gate("w", None, 2.0, None) is None          # no time to anchor
+    assert plan_gate("signoff", 1.0, None, None) is None    # no source end

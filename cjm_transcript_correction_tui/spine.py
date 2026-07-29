@@ -15,10 +15,11 @@ from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_transcript_correction_core.cli import load_capabilities
 from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
+                                                  list_source_spines, load_extraction_gates,
                                                   load_source_corrections, load_source_segments,
                                                   mark_anchor_segments, open_marks,
                                                   project_effective_spine,
-                                                  resolve_source_renditions)
+                                                  resolve_source_renditions, skeleton_hash_for)
 from cjm_transcript_correction_core.models import SpineSegment
 from cjm_transcript_correction_core.signals import speaker_turn_proposals
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
@@ -73,6 +74,8 @@ class SpineView:
         self._turns: List[Dict[str, Any]] = []        # Raw diarization turns (retained for id-scoped proposal refresh)
         self.turns_meta: Dict[str, Any] = {}          # Turns-artifact provenance (capability + metadata) — status strip + accept-op snapshots
         self.cluster_entities: Dict[str, str] = {}    # cluster label -> Entity id (cluster-name-once memory, derived from ACTIVE accepts)
+        self.skeleton_hash: Optional[str] = None     # THIS spine's identity (None = legacy; the gate's key)
+        self.gate: Optional[Dict[str, Any]] = None   # Live extraction-gate assertion (None = in_progress default, DEC 8e05b87b)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
         self._aseg_audio: List[Optional[ChunkRef]] = []  # Parallel: (wav, aseg-start) join stubs
         self.source_path: Optional[str] = None       # Original source media path (Source.path; the g/G seam decode target)
@@ -126,6 +129,13 @@ class SpineView:
         segments = await load_source_segments(self.queue, self.graph_id, self.source_id,
                                               rendition_selector=rendition,
                                               skeleton_selector=skeleton)
+        # THIS spine's identity + live extraction gate (DEC 8e05b87b): the gate is
+        # keyed per (source, skeleton_hash); no assertion = the in_progress default.
+        spines = await list_source_spines(self.queue, self.graph_id, self.source_id,
+                                          rendition_selector=rendition)
+        self.skeleton_hash = skeleton_hash_for(spines, skeleton)
+        gates = await load_extraction_gates(self.queue, self.graph_id, self.source_id)
+        self.gate = gates.get(self.skeleton_hash)
         corrections, superseded = await load_source_corrections(
             self.queue, self.graph_id, self.source_id)
         active = active_corrections(corrections, superseded)
@@ -374,6 +384,11 @@ class SpineView:
         """Local echo of a mark dismissal."""
         self._open_marks = [m for m in self._open_marks if m.get("id") != mark_id]
         self._recompute_marked_ids()
+
+    def set_gate_local(self, gate: Dict[str, Any]) -> None:
+        """Local echo of a committed extraction-gate assertion (latest-wins:
+        the newest assertion IS the live gate, DEC 8e05b87b)."""
+        self.gate = gate
 
     def add_insert_local(self, corr: dict) -> Optional[int]:
         """Local echo of a committed chunk insertion: splice the synthetic
@@ -888,3 +903,42 @@ def plan_chunk_split(
             "end_s": end,
             "boundary_words": {"left": left_text.split()[-1],
                                "right": right_text.split()[0]}}
+
+
+def plan_gate(
+    raw: str,                            # The F-editor submission: `w [sec]` | `signoff` | `exclude` | `resume`
+    cursor_end_s: Optional[float],       # The cursor segment's effective end (the pause point)
+    source_end_s: Optional[float],       # The spine's last timed end (sign-off = watermark at end-of-source)
+    current_watermark: Optional[float],  # The live gate's annotated_through (kept by exclude/resume)
+) -> Optional[Tuple[str, Optional[float]]]:  # (extraction_status, annotated_through); None = refused
+    """Plan an extraction-gate assertion (the F gesture unit; pure — DEC 8e05b87b).
+
+    The grammar is the pause-first vocabulary: `w` = watermark AT THE CURSOR
+    (the explicit-on-pause gesture — never derived from op positions), `w 123.4`
+    = an exact seconds override, `signoff` = signed_off with the watermark at
+    end-of-source, `exclude` = excluded (watermark kept — history, not erasure),
+    `resume` = back to in_progress with the watermark kept (the rescind lane).
+    Refusals (None): empty/unknown token, a non-numeric override, or a watermark
+    gesture with no time to anchor it."""
+    tokens = (raw or "").split()
+    if not tokens:
+        return None
+    verb = tokens[0].lower()
+    if verb == "w":
+        if len(tokens) > 1:
+            try:
+                return "in_progress", float(tokens[1])
+            except ValueError:
+                return None
+        if cursor_end_s is None:
+            return None
+        return "in_progress", float(cursor_end_s)
+    if verb == "signoff":
+        if source_end_s is None:
+            return None
+        return "signed_off", float(source_end_s)
+    if verb == "exclude":
+        return "excluded", current_watermark
+    if verb == "resume":
+        return "in_progress", current_watermark
+    return None
