@@ -75,10 +75,11 @@ class CorrectionApp(App):
         "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
         "yank", "nudge_end_earlier", "nudge_end_later", "nudge_start_earlier",
         "nudge_start_later", "nudge_step_down", "nudge_step_up",
-        "insert_chunk", "insert_labeled", "remove_insert",
-        "propose_accept", "propose_next", "propose_prev",
+        "insert_chunk", "insert_labeled", "remove_insert", "edit",
+        "propose_accept", "propose_next", "propose_prev", "propose_audition",
         "cycle_lane", "cancel", "quit_app"})
-    PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev"})
+    PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
+                                      "propose_audition"})
 
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
@@ -124,6 +125,7 @@ class CorrectionApp(App):
         Binding("a", "propose_accept", "accept proposal", show=False),
         Binding("n", "propose_next", "next proposal", show=False),
         Binding("N", "propose_prev", "prev proposal", show=False),
+        Binding("R", "propose_audition", "audition proposal", show=False),
         Binding("m", "mark_quick", "mark"),
         Binding("b", "mark_boundary", "mark boundary"),
         Binding("M", "mark_editor", "mark+class"),
@@ -179,7 +181,10 @@ class CorrectionApp(App):
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._mark_class = "suspect"       # last-used ⚑ class (m/b repeat it; sidecar-persisted)
         self._insert_label = "inhale"      # last-used ⊕ insert label (I pre-fills it; sidecar-persisted)
-        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark" | "insert" | "assign" | "split")
+        self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark" | "insert" | "assign" | "split" | "propose_split" | "gate")
+        self._pending_proposal = None      # (anchor index, proposal dict) awaiting the propose-split editor hop
+        self._ticker = None                # live playback-position timer (the r/R line-up readout)
+        self._tick_info = None             # (t0 monotonic, span start, span end, note, speed)
         self.lane = lane or "walk"         # active pass lane ("walk" | "assign"; tab cycles, sidecar persists)
         self._lane_arg = lane              # explicit --lane (wins over the sidecar; None = defer)
         self._entities: List[Dict[str, Any]] = []  # speaker Entity registry (graph-side, source-spanning)
@@ -473,8 +478,9 @@ class CorrectionApp(App):
             return (f"{head}  ·  proposals {pending} pending"
                     f" · set {str(meta.get('proposal_set_id') or '')[-8:]}"
                     f" · model {str(meta.get('training_run_id') or '')[-8:]}{tail}"
-                    f"  ·  a accept · n/N jump · ,./<> nudge · i/I manual · x remove"
-                    f" · j/k walk · r replay · g/G seam · tab lane · q quit")
+                    f"  ·  a accept · n/N jump · R proposal · r chunk · ,./<> nudge"
+                    f" · i/I manual · x remove · e edit · j/k walk · g/G seam"
+                    f" · tab lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
         return (f"{head}  ·  edited {edited}{tail}"
                 f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
@@ -579,23 +585,58 @@ class CorrectionApp(App):
         sid, title = self._sources[self.cursor]
         await self._open_source(sid, title)
 
+    def _start_ticker(self, start_s: float, end_s: float, note: str = "") -> None:
+        """Live playback-position readout (drive ask 2026-07-29): while audio
+        plays, the status line shows the CURRENT SOURCE TIME so the ear can
+        line a proposed span up against the r-replay. Position derives from
+        wall-clock × speed (the player has no position API); the timer
+        self-terminates at span end and any new play replaces it."""
+        self._stop_ticker()
+        self._tick_info = (time.monotonic(), start_s, end_s, note, self.speed)
+        self._ticker = self.set_interval(0.1, self._tick)
+
+    def _stop_ticker(self) -> None:
+        if self._ticker is not None:
+            self._ticker.stop()
+            self._ticker = None
+
+    def _tick(self) -> None:
+        t0, start_s, end_s, note, speed = self._tick_info
+        cur = start_s + (time.monotonic() - t0) * speed
+        if cur >= end_s:
+            cur = end_s
+            self._stop_ticker()
+        self.query_one("#status", Static).update(
+            f"▶ {cur:.2f}s · span {start_s:.2f}–{end_s:.2f}s{note} · esc stops")
+
     def _play_cursor(self) -> None:
         seg = self.view.segments[self.cursor]
+        note = ""
+        if self.lane == "propose":
+            props = self.view.event_proposals.get(seg.id)
+            if props:
+                p = props[0]
+                note = (f" · ?{p.get('label')} {float(p['start_time']):.2f}"
+                        f"–{float(p['end_time']):.2f}s")
         if seg.id in self.view.inserted_ids:
             # Synthetic chunk: its audio may exist ONLY in the original source
             # (inter-chunk gaps by construction) — decode a source slice, the
             # seam-audition path. Zero/near-zero width has nothing to sound.
             self.player.stop()
+            self._stop_ticker()
             if seg.start_time is not None and seg.end_time is not None \
                     and float(seg.end_time) - float(seg.start_time) >= 0.02:
                 self.run_worker(self._play_source_span(float(seg.start_time),
-                                                       float(seg.end_time)))
+                                                       float(seg.end_time), note=note))
             return
         c = self.view.chunk(self.cursor)
         if c is None:
             self.player.stop()
+            self._stop_ticker()
             return
         self.player.play(load_chunk(c.wav_path, c.start_s, c.end_s, speed=self.speed))
+        if seg.start_time is not None and seg.end_time is not None:
+            self._start_ticker(float(seg.start_time), float(seg.end_time), note)
 
     def _move(self, delta: int) -> None:
         if self.stage == "select":                 # the picker walks the source list
@@ -844,6 +885,9 @@ class CorrectionApp(App):
             return
         if self._input_mode == "split":
             await self._submit_split(event.value, event.input.cursor_position)
+            return
+        if self._input_mode == "propose_split":
+            await self._submit_propose_split(event.value, event.input.cursor_position)
             return
         if self._input_mode == "gate":
             await self._submit_gate(event.value)
@@ -1112,48 +1156,211 @@ class CorrectionApp(App):
     async def action_propose_accept(self) -> None:
         """a (propose lane): accept the cursor anchor's first pending proposal.
 
-        The accept gesture IS the insert op (DEC 8e05b87b, the diarization-
-        accept precedent): a labeled chunk-insert lands with the MODEL'S span;
-        nudges on top are the edit record; skipping past is the unmarked
-        reject — verdicts derive later from the bench join, never stored."""
+        The accept gesture IS the insert op (DEC 8e05b87b) — HOW it lands
+        depends on where the span sits (drive find 2026-07-29: a mid-chunk
+        accept that only grafts an overlapping insert leaves the original
+        chunk still covering the breath):
+          - in the GAP after the anchor: plain labeled insert;
+          - STRADDLING a chunk edge: insert + boundary pull(s) — the flanking
+            chunk edges nudge clear of the span (nudges = the edit record);
+          - strictly INSIDE a splittable anchor: the SPLIT CHAIN — an editor
+            hop places the text cut (caret pre-seeded proportionally to the
+            span start), then split + insert-between + right-half pull land
+            as three journaled ops (x unsplits / x removes undo them);
+          - inside but NOT splittable (synthetic or <2 words): overlay insert
+            only, S splits manually — never a silent coverage loss."""
         view = self.view
-        seg = view.segments[self.cursor]
+        i = self.cursor
+        seg = view.segments[i]
+        status = self.query_one("#status", Static)
         props = view.event_proposals.get(seg.id)
         if not props:
-            self.query_one("#status", Static).update(
-                "no pending proposal at cursor — n/N jump to one")
+            status.update("no pending proposal at cursor — n/N jump to one")
             return
         p = props[0]
-        plan = plan_chunk_insert(view.segments, self.cursor,
-                                 inserted_ids=view.inserted_ids,
+        ps, pe = float(p["start_time"]), float(p["end_time"])
+        eps = 0.05
+        a_start = float(seg.start_time) if seg.start_time is not None else None
+        a_end = float(seg.end_time) if seg.end_time is not None else None
+        interior = (a_start is not None and a_end is not None
+                    and ps > a_start + eps and pe < a_end - eps)
+        # plan_chunk_split handles synthetics uniformly (anchors resolve past
+        # them) — only textless/one-word chunks can't divide.
+        splittable = interior and len((seg.text or "").split()) >= 2
+        if splittable:
+            # The editor hop (the assign a-gesture precedent): the human owns
+            # the TEXT division, the model owns the cut TIME.
+            self._pending_proposal = (i, p)
+            editor = self.query_one("#editor", Input)
+            self._input_mode = "propose_split"
+            editor.value = seg.text
+            editor.display = True
+            editor.focus()
+            frac = (ps - a_start) / max(a_end - a_start, 1e-6)
+            editor.cursor_position = max(0, min(len(seg.text),
+                                                round(len(seg.text) * frac)))
+            status.update(f"accept: caret marks the text cut at {ps:.2f}s"
+                          " · enter = split + inhale between · esc cancels")
+            return
+
+        plan = plan_chunk_insert(view.segments, i, inserted_ids=view.inserted_ids,
                                  insert_ranks=view.insert_ranks)
         if plan is None:
-            self.query_one("#status", Static).update(
-                "accept: refused (missing times, or an overlapping boundary "
-                "— nudge the overlap first)")
+            status.update("accept: refused (missing times, or an overlapping "
+                          "boundary — nudge the overlap first)")
             return
-        start_s, end_s = float(p["start_time"]), float(p["end_time"])
+        nxt = view.segments[i + 1] if i + 1 < view.size else None
         insert_id = await commit_chunk_insert_correction(
             view.queue, view.graph_id, view.source_id,
-            plan["after_id"], start_s, end_s, self.session_id,
+            plan["after_id"], ps, pe, self.session_id,
             before_segment_id=plan["before_id"], label=p.get("label"),
             rank=plan["rank"], actor=self.actor, journal_path=self._journal_path)
         pos = view.add_insert_local(
             {"id": insert_id,
              "payload": {"operation": "chunk_insert",
                          "after_segment_id": plan["after_id"],
-                         "start_time": start_s, "end_time": end_s,
+                         "start_time": ps, "end_time": pe,
                          "label": p.get("label"), "text": "", "rank": plan["rank"]}})
         view.accept_proposal_local(seg.id, str(p.get("proposal_id")), insert_id)
+        note = ""
+        if not interior:
+            # Straddle pulls: a span reaching into a flanking chunk pulls that
+            # edge clear (the accepted span owns its time; the pull is spine
+            # truth the bench reads as part of the accept).
+            if a_end is not None and ps < a_end - eps:
+                last = ((seg.text or "").split() or [None])[-1]
+                await self._commit_span_nudge(seg.id, "end", a_end, ps,
+                                              {"left": last, "right": None})
+                note = " · anchor end pulled"
+            if nxt is not None and nxt.start_time is not None \
+                    and pe > float(nxt.start_time) + eps:
+                first = ((nxt.text or "").split() or [None])[0]
+                await self._commit_span_nudge(nxt.id, "start",
+                                              float(nxt.start_time), pe,
+                                              {"left": None, "right": first})
+                note = note or " · next start pulled"
+        else:
+            note = " · mid-chunk, text not divisible — overlay insert only"
         if pos is not None:
             self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
             self.cursor = pos
         self._render()
-        self.query_one("#status", Static).update(
-            f"✓ accepted {p.get('label')} {start_s:.2f}–{end_s:.2f}s"
-            f" (score {float(p.get('score') or 0):.2f}) · ,./<> nudge if off · playing span")
         self.player.stop()
-        self.run_worker(self._play_source_span(start_s, end_s))
+        self.run_worker(self._play_source_span(
+            ps, pe, note=f" · ✓ {p.get('label')} accepted{note}"))
+
+    async def _submit_propose_split(self, value: str, caret: int) -> None:
+        """The propose-accept editor hop's submission: split the anchor at the
+        PROPOSAL's start (the caret only divides text — the model owns the
+        seed time, unlike S where the caret interpolates it), insert the
+        labeled span between the halves, and pull the right half's start past
+        the span end. One gesture, three journaled ops."""
+        self._close_editor()
+        view = self.view
+        status = self.query_one("#status", Static)
+        pending, self._pending_proposal = self._pending_proposal, None
+        if pending is None:
+            self._render()
+            return
+        i, p = pending
+        seg = view.segments[i] if 0 <= i < view.size else None
+        head = (view.event_proposals.get(seg.id) or [None])[0] if seg else None
+        if head is None or head.get("proposal_id") != p.get("proposal_id"):
+            self._render()
+            status.update("accept: proposal state changed — n/N jump again")
+            return
+        ps, pe = float(p["start_time"]), float(p["end_time"])
+        plan = plan_chunk_split(view.segments, i, caret, text=value,
+                                inserted_ids=view.inserted_ids)
+        if plan is None:
+            self._render()
+            status.update("accept: split refused (the caret must leave words "
+                          "on both sides of the cut)")
+            return
+        plan["split_s"] = ps   # the MODEL's span start is the cut, not the caret fraction
+        old_text = seg.text
+        ids = await commit_chunk_split_correction(
+            view.queue, view.graph_id, view.source_id, plan["segment_id"],
+            plan["split_s"], plan["left_text"], plan["right_text"], plan["end_s"],
+            self.session_id, plan["after_id"], before_segment_id=plan["before_id"],
+            old_text=old_text, boundary_words=plan["boundary_words"],
+            actor=self.actor, journal_path=self._journal_path)
+        pos_r = view.split_local(i, plan["left_text"], plan["split_s"],
+                                 {"id": ids["insert_id"],
+                                  "payload": {"operation": "chunk_insert",
+                                              "after_segment_id": plan["after_id"],
+                                              "start_time": plan["split_s"],
+                                              "end_time": plan["end_s"],
+                                              "label": None,
+                                              "text": plan["right_text"]}})
+        view.split_groups[ids["insert_id"]] = {
+            "group_ids": [ids["text_id"], ids["nudge_id"]],
+            "target_id": plan["segment_id"], "old_text": old_text,
+            "old_end": plan["end_s"]}
+        if pos_r is not None:
+            self._marks = {(k + 1 if k >= pos_r else k): v for k, v in self._marks.items()}
+        iplan = plan_chunk_insert(view.segments, i, inserted_ids=view.inserted_ids,
+                                  insert_ranks=view.insert_ranks)
+        if iplan is None:
+            self._render()
+            status.update("accept: split landed but the between-insert "
+                          "refused — i inserts manually")
+            return
+        insert_id = await commit_chunk_insert_correction(
+            view.queue, view.graph_id, view.source_id,
+            iplan["after_id"], ps, pe, self.session_id,
+            before_segment_id=iplan["before_id"], label=p.get("label"),
+            rank=iplan["rank"], actor=self.actor, journal_path=self._journal_path)
+        pos = view.add_insert_local(
+            {"id": insert_id,
+             "payload": {"operation": "chunk_insert",
+                         "after_segment_id": iplan["after_id"],
+                         "start_time": ps, "end_time": pe,
+                         "label": p.get("label"), "text": "", "rank": iplan["rank"]}})
+        view.accept_proposal_local(seg.id, str(p.get("proposal_id")), insert_id)
+        # the split welded the right half at ps; the span owns [ps, pe] now
+        right_first = ((plan["right_text"] or "").split() or [None])[0]
+        await self._commit_span_nudge(ids["insert_id"], "start", ps, pe,
+                                      {"left": None, "right": right_first})
+        if pos is not None:
+            self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
+            self.cursor = pos
+        self._render()
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            ps, pe, note=f" · ✓ {p.get('label')} isolated (split + insert)"))
+
+    async def _commit_span_nudge(self, segment_id: str, edge: str, old_t: float,
+                                 new_t: float, words: Dict[str, Any]) -> None:
+        """One ABSOLUTE boundary move as a time-nudge correction (manual plan —
+        the accept chain knows target times, not ladder deltas) + local echo."""
+        plan = [{"segment_id": segment_id, "edge": edge,
+                 "old_time": old_t, "new_time": new_t}]
+        await commit_time_nudge_correction(
+            self.view.queue, self.view.graph_id, self.view.source_id, plan,
+            self.session_id, boundary_words=words, step_s=new_t - old_t,
+            actor=self.actor, journal_path=self._journal_path)
+        seg = next((s for s in self.view.segments if s.id == segment_id), None)
+        if seg is not None:
+            if edge == "start":
+                seg.start_time = new_t
+            else:
+                seg.end_time = new_t
+
+    def action_propose_audition(self) -> None:
+        """R (propose lane): audition the cursor anchor's first pending
+        proposal span — pairs with r (chunk replay) so actual and proposed
+        line up by ear (drive ask 2026-07-29); the live ticker shows position."""
+        props = self.view.event_proposals.get(self.view.segments[self.cursor].id)
+        if not props:
+            self.query_one("#status", Static).update(
+                "no pending proposal at cursor — n/N jump to one")
+            return
+        p = props[0]
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            float(p["start_time"]), float(p["end_time"]),
+            note=f" · ?{p.get('label')} score {float(p.get('score') or 0):.2f} · a accepts"))
 
     def action_propose_next(self) -> None:
         """n (propose lane): jump to the next pending proposal and audition it."""
@@ -1176,12 +1383,11 @@ class CorrectionApp(App):
                 self.cursor = i
                 self._render()
                 p = props[0]
-                self.query_one("#status", Static).update(
-                    f"?{p.get('label')} {float(p['start_time']):.2f}–{float(p['end_time']):.2f}s"
-                    f" score {float(p.get('score') or 0):.2f} · a accepts · playing span")
                 self.player.stop()
                 self.run_worker(self._play_source_span(
-                    float(p["start_time"]), float(p["end_time"])))
+                    float(p["start_time"]), float(p["end_time"]),
+                    note=f" · ?{p.get('label')} score {float(p.get('score') or 0):.2f}"
+                         " · a accepts · R replays"))
                 return
         self.query_one("#status", Static).update("no more pending proposals this way")
 
@@ -1404,9 +1610,11 @@ class CorrectionApp(App):
             status.update(f"⊖ removed inserted chunk"
                           f" ({seg.start_time:.2f}–{seg.end_time:.2f}s)")
 
-    async def _play_source_span(self, start_s: float, end_s: float) -> None:
+    async def _play_source_span(self, start_s: float, end_s: float,
+                                note: str = "") -> None:
         """Decode + play a source-coordinate span of the ORIGINAL media — the
-        inserted-chunk playback path (no model-input WAV need cover it)."""
+        inserted-chunk playback path (no model-input WAV need cover it). The
+        live ticker rides every span play; `note` names what is sounding."""
         path = self.view.source_path
         status = self.query_one("#status", Static)
         if not path or not Path(path).exists():
@@ -1421,6 +1629,7 @@ class CorrectionApp(App):
         if self.speed != 1.0 and len(samples):
             samples = stretch(samples, self.speed)
         self.player.play(samples)
+        self._start_ticker(start_s, end_s, note)
 
     async def _shift_boundary(self, direction: str) -> None:
         """One [ / ] press: move ONE word across the boundary AFTER the cursor.
@@ -1695,10 +1904,12 @@ class CorrectionApp(App):
         editor = self.query_one("#editor", Input)
         if editor.display:
             self._accept_cluster = None  # an aborted a-gesture must not hijack the next assign
+            self._pending_proposal = None  # an aborted propose-split hop likewise
             self._close_editor()
             self._render()
         else:
             self.player.stop()
+            self._stop_ticker()
 
     async def action_quit_app(self) -> None:
         if self.view is not None:
