@@ -75,7 +75,7 @@ class CorrectionApp(App):
         "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
         "yank", "nudge_end_earlier", "nudge_end_later", "nudge_start_earlier",
         "nudge_start_later", "nudge_step_down", "nudge_step_up",
-        "insert_chunk", "insert_labeled", "remove_insert", "edit",
+        "insert_chunk", "insert_labeled", "relabel_insert", "remove_insert", "edit",
         "propose_accept", "propose_next", "propose_prev", "propose_audition",
         "cycle_lane", "cancel", "quit_app"})
     PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
@@ -105,6 +105,7 @@ class CorrectionApp(App):
         Binding("right_square_bracket", "speed_up", "faster", key_display="]"),
         Binding("i", "insert_chunk", "insert chunk"),
         Binding("I", "insert_labeled", "insert+label", show=False),
+        Binding("L", "relabel_insert", "relabel insert", show=False),
         Binding("x", "remove_insert", "remove insert", show=False),
         Binding("S", "split_chunk", "split chunk", show=False),
         Binding("e", "edit", "edit text"),
@@ -479,8 +480,8 @@ class CorrectionApp(App):
                     f" · set {str(meta.get('proposal_set_id') or '')[-8:]}"
                     f" · model {str(meta.get('training_run_id') or '')[-8:]}{tail}"
                     f"  ·  a accept · n/N jump · R proposal · r chunk · ,./<> nudge"
-                    f" · i/I manual · x remove · e edit · j/k walk · g/G seam"
-                    f" · tab lane · q quit")
+                    f" · i/I manual · L relabel · x remove · e edit · j/k walk"
+                    f" · g/G seam · tab lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
         return (f"{head}  ·  edited {edited}{tail}"
                 f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
@@ -892,6 +893,9 @@ class CorrectionApp(App):
             return
         if self._input_mode == "propose_split":
             await self._submit_propose_split(event.value, event.input.cursor_position)
+            return
+        if self._input_mode == "relabel":
+            await self._submit_relabel(event.value)
             return
         if self._input_mode == "gate":
             await self._submit_gate(event.value)
@@ -1575,6 +1579,98 @@ class CorrectionApp(App):
         self._render()
         status.update(f"✂ split #{seg.index} at {plan['split_s']:.2f}s (caret-seeded)"
                       " — ,/. tunes the new seam · g auditions it")
+
+    def action_relabel_insert(self) -> None:
+        """L: relabel the inserted chunk under the cursor (drive ask
+        2026-07-29: accepted 'inhale' proposals that turn out to be dead air
+        need a one-gesture reclassification — 'dead-air' tightens speech
+        chunks without polluting the inhale class). Opens the I-editor menu
+        pre-filled with the CURRENT label; commits as supersede + re-insert
+        (same span, same anchors, new label) — no new op vocabulary, and the
+        bench derives it as a RELABELED verdict. Split right halves refuse
+        (their label is structural, x unsplits them)."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        if seg.id not in view.inserted_ids:
+            status.update("relabel: only inserted (⊕) chunks carry labels")
+            return
+        if seg.id in view.split_groups:
+            status.update("relabel: a split right half has no class label (x unsplits)")
+            return
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "relabel"
+        editor.value = f"{view.insert_labels.get(seg.id) or self._insert_label} "
+        editor.display = True
+        editor.focus()
+        menu = self._insert_label_menu()
+        status.update("relabel: class-or-# · "
+                      + " ".join(f"{i + 1}:{c}" for i, c in enumerate(menu)))
+
+    async def _submit_relabel(self, raw: str) -> None:
+        """The L-editor submission: supersede the insert and re-commit it with
+        the new label — identical span/anchors/rank, so the projection and the
+        bench see the same event under its corrected class."""
+        self._close_editor()
+        view = self.view
+        status = self.query_one("#status", Static)
+        raw, err = resolve_mark_class_token(raw, self._insert_label_menu())
+        if err:
+            self._render()
+            status.update(f"relabel: {err}")
+            return
+        tokens = (raw or "").split()
+        if not tokens:
+            self._render()
+            return
+        label = tokens[0].strip('`"\'')
+        if not label or not label[:1].isalnum():
+            self._render()
+            status.update("relabel: label must start with a letter or digit")
+            return
+        i = self.cursor
+        seg = view.segments[i]
+        if seg.id not in view.inserted_ids or seg.start_time is None:
+            self._render()
+            status.update("relabel: cursor moved off the insert — try again")
+            return
+        old_label = view.insert_labels.get(seg.id)
+        if label == old_label:
+            self._render()
+            status.update(f"relabel: already [{label}]")
+            return
+        start_s, end_s = float(seg.start_time), float(seg.end_time)
+        rank = view.insert_ranks.get(seg.id, 0.0)
+        text = seg.text or ""
+        # anchors re-derive like plan_chunk_insert: nearest layer-0 flanks
+        after_id = next((view.segments[j].id for j in range(i - 1, -1, -1)
+                         if view.segments[j].id not in view.inserted_ids), None)
+        before_id = next((view.segments[j].id for j in range(i + 1, view.size)
+                          if view.segments[j].id not in view.inserted_ids), None)
+        if after_id is None:
+            self._render()
+            status.update("relabel: no layer-0 anchor left of the insert")
+            return
+        await commit_chunk_insert_removal(
+            view.queue, view.graph_id, view.source_id, seg.id,
+            self.session_id, actor=self.actor, journal_path=self._journal_path)
+        view.remove_insert_local(seg.id)
+        insert_id = await commit_chunk_insert_correction(
+            view.queue, view.graph_id, view.source_id,
+            after_id, start_s, end_s, self.session_id,
+            before_segment_id=before_id, label=label,
+            rank=rank, actor=self.actor, journal_path=self._journal_path)
+        pos = view.add_insert_local(
+            {"id": insert_id,
+             "payload": {"operation": "chunk_insert", "after_segment_id": after_id,
+                         "start_time": start_s, "end_time": end_s,
+                         "label": label, "text": text, "rank": rank}})
+        if pos is not None:
+            self.cursor = pos
+        view.refresh_event_proposals()
+        self._render()
+        status.update(f"↺ relabeled [{old_label or '∅'}] → [{label}]"
+                      f" ({start_s:.2f}–{end_s:.2f}s)")
 
     async def action_remove_insert(self) -> None:
         """x: remove the inserted chunk under the cursor (reject-as-supersede,
