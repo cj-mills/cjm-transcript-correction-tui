@@ -76,6 +76,7 @@ class SpineView:
         self.turns_meta: Dict[str, Any] = {}          # Turns-artifact provenance (capability + metadata) — status strip + accept-op snapshots
         self.cluster_entities: Dict[str, str] = {}    # cluster label -> Entity id (cluster-name-once memory, derived from ACTIVE accepts)
         self.event_proposals: Dict[str, List[Dict[str, Any]]] = {}  # anchor segment id -> pending event proposals (propose lane; {} = no set)
+        self._event_proposals_raw: List[Dict[str, Any]] = []  # The full proposal set (pending DERIVES from this vs spine state)
         self.proposals_meta: Dict[str, Any] = {}      # Proposal-set provenance (set id + model + window) — status strip
         self.skeleton_hash: Optional[str] = None     # THIS spine's identity (None = legacy; the gate's key)
         self.gate: Optional[Dict[str, Any]] = None   # Live extraction-gate assertion (None = in_progress default, DEC 8e05b87b)
@@ -247,18 +248,13 @@ class SpineView:
                                            source_id=self.source_id)
             if pset:
                 m = pset["manifest"]
-                occupied = [(float(s.start_time), float(s.end_time))
-                            for s in self.segments
-                            if s.id in self.inserted_ids
-                            and s.start_time is not None and s.end_time is not None]
-                self.event_proposals = event_span_proposals(
-                    self.segments, pset["proposals"], occupied)
+                self._event_proposals_raw = pset["proposals"]
                 self.proposals_meta = {
                     "proposal_set_id": m.get("proposal_set_id"),
                     "training_run_id": m.get("training_run_id"),
                     "window": m.get("window") or {},
-                    "classes": m.get("classes") or [],
-                    "pending": sum(len(v) for v in self.event_proposals.values())}
+                    "classes": m.get("classes") or []}
+                self.refresh_event_proposals()
         # cluster-name-once memory: prior accepts journaled their cluster in
         # the proposal snapshot; the projection carries it back (8a4df244).
         self.cluster_entities = {
@@ -446,19 +442,26 @@ class SpineView:
         self.insert_ranks[corr["id"]] = rank
         return at
 
-    def accept_proposal_local(self, anchor_id: str, proposal_id: str,
-                              new_segment_id: Optional[str] = None) -> None:
-        """Local echo of an accepted event proposal: drop it from the pending
-        map and RE-ANCHOR the anchor's remaining proposals onto the freshly
-        spliced synthetic segment (they now follow it — the after-anchor
-        convention a reload would derive). Pending count refreshes."""
-        remaining = [p for p in (self.event_proposals.pop(anchor_id, None) or [])
-                     if p.get("proposal_id") != proposal_id]
-        if remaining:
-            self.event_proposals[new_segment_id or anchor_id] = remaining
-        if self.proposals_meta:
-            self.proposals_meta["pending"] = sum(
-                len(v) for v in self.event_proposals.values())
+    def refresh_event_proposals(self) -> None:
+        """Re-derive the pending map from the RAW proposal set against CURRENT
+        spine state (drive find 2026-07-29: an x-removed accept must give its
+        proposal back — pending is a DERIVATION, never decayed by echoes).
+
+        Occupied = LABELED event inserts only: a split right half or a plain
+        i-insert is a text/audio chunk, not a materialized event — a proposal
+        inside one stays pending. Accept/remove/unsplit echoes all call this
+        after mutating the spine; anchors re-derive with it."""
+        if not self._event_proposals_raw:
+            return
+        occupied = [(float(s.start_time), float(s.end_time))
+                    for s in self.segments
+                    if s.id in self.inserted_ids
+                    and self.insert_labels.get(s.id)
+                    and s.start_time is not None and s.end_time is not None]
+        self.event_proposals = event_span_proposals(
+            self.segments, self._event_proposals_raw, occupied)
+        self.proposals_meta["pending"] = sum(
+            len(v) for v in self.event_proposals.values())
 
     def refresh_turn_proposal(self, segment_id: str) -> None:
         """Recompute ONE segment's diarization proposal (id-scoped, cheap).

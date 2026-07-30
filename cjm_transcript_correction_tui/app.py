@@ -604,8 +604,12 @@ class CorrectionApp(App):
         t0, start_s, end_s, note, speed = self._tick_info
         cur = start_s + (time.monotonic() - t0) * speed
         if cur >= end_s:
-            cur = end_s
+            # Span done: hand the status line BACK to the lane (drive find
+            # 2026-07-29 — a stuck readout forced a lane-cycle to clear it).
             self._stop_ticker()
+            if not self.query_one("#editor", Input).display:
+                self.query_one("#status", Static).update(self._status_line())
+            return
         self.query_one("#status", Static).update(
             f"▶ {cur:.2f}s · span {start_s:.2f}–{end_s:.2f}s{note} · esc stops")
 
@@ -1221,7 +1225,6 @@ class CorrectionApp(App):
                          "after_segment_id": plan["after_id"],
                          "start_time": ps, "end_time": pe,
                          "label": p.get("label"), "text": "", "rank": plan["rank"]}})
-        view.accept_proposal_local(seg.id, str(p.get("proposal_id")), insert_id)
         note = ""
         if not interior:
             # Straddle pulls: a span reaching into a flanking chunk pulls that
@@ -1244,6 +1247,7 @@ class CorrectionApp(App):
         if pos is not None:
             self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
             self.cursor = pos
+        view.refresh_event_proposals()  # the accepted span now occupies — pending re-derives
         self._render()
         self.player.stop()
         self.run_worker(self._play_source_span(
@@ -1317,7 +1321,6 @@ class CorrectionApp(App):
                          "after_segment_id": iplan["after_id"],
                          "start_time": ps, "end_time": pe,
                          "label": p.get("label"), "text": "", "rank": iplan["rank"]}})
-        view.accept_proposal_local(seg.id, str(p.get("proposal_id")), insert_id)
         # the split welded the right half at ps; the span owns [ps, pe] now
         right_first = ((plan["right_text"] or "").split() or [None])[0]
         await self._commit_span_nudge(ids["insert_id"], "start", ps, pe,
@@ -1325,6 +1328,7 @@ class CorrectionApp(App):
         if pos is not None:
             self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
             self.cursor = pos
+        view.refresh_event_proposals()  # the accepted span now occupies — pending re-derives
         self._render()
         self.player.stop()
         self.run_worker(self._play_source_span(
@@ -1602,6 +1606,9 @@ class CorrectionApp(App):
             self._marks = {(k - 1 if k > pos else k): v
                            for k, v in self._marks.items() if k != pos}
             self.cursor = max(0, min(view.size - 1, self.cursor))
+        # An x-removed accept gives its proposal BACK (pending derives from
+        # the raw set vs spine state — drive find 2026-07-29).
+        view.refresh_event_proposals()
         self._render()
         if info:
             status.update(f"⊖ unsplit: right half removed, target restored"
@@ -1910,6 +1917,7 @@ class CorrectionApp(App):
         else:
             self.player.stop()
             self._stop_ticker()
+            self._render()  # esc hands the status line back to the lane
 
     async def action_quit_app(self) -> None:
         if self.view is not None:
