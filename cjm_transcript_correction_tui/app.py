@@ -67,6 +67,19 @@ class CorrectionApp(App):
     ASSIGN_ONLY_ACTIONS = frozenset({"assign_pick", "assign_same", "assign_new",
                                      "assign_accept"})
 
+    # The propose lane (leg 4, DEC 8e05b87b): model event proposals driven
+    # through the SAME accept-is-an-insert-op gesture; nudges on top are the
+    # edit record, skipping past is the unmarked reject. Manual insert keys
+    # stay live — a model miss found by ear is bench data too.
+    PROPOSE_LANE_ACTIONS = frozenset({
+        "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+        "yank", "nudge_end_earlier", "nudge_end_later", "nudge_start_earlier",
+        "nudge_start_later", "nudge_step_down", "nudge_step_up",
+        "insert_chunk", "insert_labeled", "remove_insert",
+        "propose_accept", "propose_next", "propose_prev",
+        "cycle_lane", "cancel", "quit_app"})
+    PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev"})
+
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
     """
@@ -108,6 +121,9 @@ class CorrectionApp(App):
         Binding("5", "assign_pick(5)", show=False), Binding("6", "assign_pick(6)", show=False),
         Binding("7", "assign_pick(7)", show=False), Binding("8", "assign_pick(8)", show=False),
         Binding("9", "assign_pick(9)", show=False),
+        Binding("a", "propose_accept", "accept proposal", show=False),
+        Binding("n", "propose_next", "next proposal", show=False),
+        Binding("N", "propose_prev", "prev proposal", show=False),
         Binding("m", "mark_quick", "mark"),
         Binding("b", "mark_boundary", "mark boundary"),
         Binding("M", "mark_editor", "mark+class"),
@@ -339,6 +355,18 @@ class CorrectionApp(App):
                 chip = Text("∅ ▏", style="dim")
             chip.append_text(body)
             body = chip
+        elif self.lane == "propose":
+            # Pending-proposal chip: the propose lane's object of attention —
+            # ?label + score on the ANCHOR card (the segment the accept would
+            # insert after); ×n when several stack in one gap.
+            props = view.event_proposals.get(seg.id)
+            if props:
+                p = props[0]
+                extra = f"×{len(props)}" if len(props) > 1 else ""
+                chip = Text(f"?{p.get('label')} {float(p.get('score') or 0):.2f}{extra} ▏",
+                            style="dim cyan")
+                chip.append_text(body)
+                body = chip
         if abs(pos - self.cursor) > 1 and seg.text:
             body.stylize("dim")
         lane = body.wrap(self.console, lane_w)
@@ -417,7 +445,7 @@ class CorrectionApp(App):
         badge (d915d545 b — TEST PASS under --test, nothing when genuine) +
         position + lane-scoped counters + the ACTIVE LANE's keybar only."""
         view = self.view
-        badges = "\\[ASSIGN]" if self.lane == "assign" else "\\[WALK]"
+        badges = {"assign": "\\[ASSIGN]", "propose": "\\[PROPOSE]"}.get(self.lane, "\\[WALK]")
         if self.purpose:
             badges += (" \\[TEST PASS]" if self.purpose == "feature-test"
                        else f" \\[{self.purpose.upper()}]")
@@ -439,6 +467,14 @@ class CorrectionApp(App):
                     f"  ·  speaker: {active}{tail}"
                     f"  ·  a accept · 1-9 pick · space same · A new · j/k walk · r replay"
                     f" · g/G seam · \\[/] speed · y copy · tab walk-lane · q quit")
+        if self.lane == "propose":
+            meta = view.proposals_meta or {}
+            pending = meta.get("pending", 0)
+            return (f"{head}  ·  proposals {pending} pending"
+                    f" · set {str(meta.get('proposal_set_id') or '')[-8:]}"
+                    f" · model {str(meta.get('training_run_id') or '')[-8:]}{tail}"
+                    f"  ·  a accept · n/N jump · ,./<> nudge · i/I manual · x remove"
+                    f" · j/k walk · r replay · g/G seam · tab lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
         return (f"{head}  ·  edited {edited}{tail}"
                 f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
@@ -522,7 +558,9 @@ class CorrectionApp(App):
             return action in ("next", "prev", "open_source", "quit_app")
         if self.lane == "assign":
             return action in self.ASSIGN_LANE_ACTIONS
-        return action not in self.ASSIGN_ONLY_ACTIONS
+        if self.lane == "propose":
+            return action in self.PROPOSE_LANE_ACTIONS
+        return action not in (self.ASSIGN_ONLY_ACTIONS | self.PROPOSE_ONLY_ACTIONS)
 
     async def action_open_source(self) -> None:
         if self.stage == "spine":
@@ -857,7 +895,11 @@ class CorrectionApp(App):
         editor guard keeps a priority tab from hijacking an open edit."""
         if self.query_one("#editor", Input).display:
             return
-        self.lane = "assign" if self.lane == "walk" else "walk"
+        # walk -> assign -> propose -> walk; the propose lane only enters the
+        # rotation when a proposal set loaded (no set = the walk stays manual).
+        order = ["walk", "assign"] + (["propose"] if self.view.proposals_meta else [])
+        self.lane = order[(order.index(self.lane) + 1) % len(order)] \
+            if self.lane in order else "walk"
         save_tui_state(self._graph_db_path, self.view.source_id, None, lane=self.lane)
         self._render()
         if self.lane == "assign":
@@ -1066,6 +1108,82 @@ class CorrectionApp(App):
         self._render()
         self.query_one("#status", Static).update(
             f"@ #{idx} → {self._entity_name(entity_id)}")
+
+    async def action_propose_accept(self) -> None:
+        """a (propose lane): accept the cursor anchor's first pending proposal.
+
+        The accept gesture IS the insert op (DEC 8e05b87b, the diarization-
+        accept precedent): a labeled chunk-insert lands with the MODEL'S span;
+        nudges on top are the edit record; skipping past is the unmarked
+        reject — verdicts derive later from the bench join, never stored."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        props = view.event_proposals.get(seg.id)
+        if not props:
+            self.query_one("#status", Static).update(
+                "no pending proposal at cursor — n/N jump to one")
+            return
+        p = props[0]
+        plan = plan_chunk_insert(view.segments, self.cursor,
+                                 inserted_ids=view.inserted_ids,
+                                 insert_ranks=view.insert_ranks)
+        if plan is None:
+            self.query_one("#status", Static).update(
+                "accept: refused (missing times, or an overlapping boundary "
+                "— nudge the overlap first)")
+            return
+        start_s, end_s = float(p["start_time"]), float(p["end_time"])
+        insert_id = await commit_chunk_insert_correction(
+            view.queue, view.graph_id, view.source_id,
+            plan["after_id"], start_s, end_s, self.session_id,
+            before_segment_id=plan["before_id"], label=p.get("label"),
+            rank=plan["rank"], actor=self.actor, journal_path=self._journal_path)
+        pos = view.add_insert_local(
+            {"id": insert_id,
+             "payload": {"operation": "chunk_insert",
+                         "after_segment_id": plan["after_id"],
+                         "start_time": start_s, "end_time": end_s,
+                         "label": p.get("label"), "text": "", "rank": plan["rank"]}})
+        view.accept_proposal_local(seg.id, str(p.get("proposal_id")), insert_id)
+        if pos is not None:
+            self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
+            self.cursor = pos
+        self._render()
+        self.query_one("#status", Static).update(
+            f"✓ accepted {p.get('label')} {start_s:.2f}–{end_s:.2f}s"
+            f" (score {float(p.get('score') or 0):.2f}) · ,./<> nudge if off · playing span")
+        self.player.stop()
+        self.run_worker(self._play_source_span(start_s, end_s))
+
+    def action_propose_next(self) -> None:
+        """n (propose lane): jump to the next pending proposal and audition it."""
+        self._jump_proposal(+1)
+
+    def action_propose_prev(self) -> None:
+        """N (propose lane): jump to the previous pending proposal and audition it."""
+        self._jump_proposal(-1)
+
+    def _jump_proposal(self, direction: int) -> None:
+        """Cursor to the nearest anchor with pending proposals in `direction`
+        and AUDITION the first one's source span — judge on one keypress,
+        accept on the next (the bench pass's assist rhythm)."""
+        view = self.view
+        rng = (range(self.cursor + 1, view.size) if direction > 0
+               else range(self.cursor - 1, -1, -1))
+        for i in rng:
+            props = view.event_proposals.get(view.segments[i].id)
+            if props:
+                self.cursor = i
+                self._render()
+                p = props[0]
+                self.query_one("#status", Static).update(
+                    f"?{p.get('label')} {float(p['start_time']):.2f}–{float(p['end_time']):.2f}s"
+                    f" score {float(p.get('score') or 0):.2f} · a accepts · playing span")
+                self.player.stop()
+                self.run_worker(self._play_source_span(
+                    float(p["start_time"]), float(p["end_time"])))
+                return
+        self.query_one("#status", Static).update("no more pending proposals this way")
 
     async def action_insert_chunk(self) -> None:
         """i: insert a chunk into the gap AFTER the cursor (DEC 3d3fa2a8) —

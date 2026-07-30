@@ -21,7 +21,8 @@ from cjm_transcript_correction_core.graph import (active_corrections, active_spe
                                                   project_effective_spine,
                                                   resolve_source_renditions, skeleton_hash_for)
 from cjm_transcript_correction_core.models import SpineSegment
-from cjm_transcript_correction_core.signals import speaker_turn_proposals
+from cjm_transcript_correction_core.signals import (event_span_proposals, load_event_proposal_set,
+                                                    speaker_turn_proposals)
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
 
 
@@ -74,6 +75,8 @@ class SpineView:
         self._turns: List[Dict[str, Any]] = []        # Raw diarization turns (retained for id-scoped proposal refresh)
         self.turns_meta: Dict[str, Any] = {}          # Turns-artifact provenance (capability + metadata) — status strip + accept-op snapshots
         self.cluster_entities: Dict[str, str] = {}    # cluster label -> Entity id (cluster-name-once memory, derived from ACTIVE accepts)
+        self.event_proposals: Dict[str, List[Dict[str, Any]]] = {}  # anchor segment id -> pending event proposals (propose lane; {} = no set)
+        self.proposals_meta: Dict[str, Any] = {}      # Proposal-set provenance (set id + model + window) — status strip
         self.skeleton_hash: Optional[str] = None     # THIS spine's identity (None = legacy; the gate's key)
         self.gate: Optional[Dict[str, Any]] = None   # Live extraction-gate assertion (None = in_progress default, DEC 8e05b87b)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
@@ -234,6 +237,28 @@ class SpineView:
                                    "metadata": artifact.get("metadata") or {}}
                 self._turns = artifact.get("turns") or []
                 self.turn_proposals = speaker_turn_proposals(self.segments, self._turns)
+        # Event-proposal overlay (leg 4, DEC 8e05b87b): same discovery shape as
+        # the turns artifact — workspace + source identity name the latest
+        # proposal set; no set = no propose lane and the walk stays manual.
+        # Proposals overlapping an already-materialized insert are dropped at
+        # load (accepted in a prior session — the verdict join owns history).
+        if ws_root and (chash or self.source_id):
+            pset = load_event_proposal_set(ws_root, content_hash=chash or None,
+                                           source_id=self.source_id)
+            if pset:
+                m = pset["manifest"]
+                occupied = [(float(s.start_time), float(s.end_time))
+                            for s in self.segments
+                            if s.id in self.inserted_ids
+                            and s.start_time is not None and s.end_time is not None]
+                self.event_proposals = event_span_proposals(
+                    self.segments, pset["proposals"], occupied)
+                self.proposals_meta = {
+                    "proposal_set_id": m.get("proposal_set_id"),
+                    "training_run_id": m.get("training_run_id"),
+                    "window": m.get("window") or {},
+                    "classes": m.get("classes") or [],
+                    "pending": sum(len(v) for v in self.event_proposals.values())}
         # cluster-name-once memory: prior accepts journaled their cluster in
         # the proposal snapshot; the projection carries it back (8a4df244).
         self.cluster_entities = {
@@ -420,6 +445,20 @@ class SpineView:
         self.insert_labels[corr["id"]] = p.get("label")
         self.insert_ranks[corr["id"]] = rank
         return at
+
+    def accept_proposal_local(self, anchor_id: str, proposal_id: str,
+                              new_segment_id: Optional[str] = None) -> None:
+        """Local echo of an accepted event proposal: drop it from the pending
+        map and RE-ANCHOR the anchor's remaining proposals onto the freshly
+        spliced synthetic segment (they now follow it — the after-anchor
+        convention a reload would derive). Pending count refreshes."""
+        remaining = [p for p in (self.event_proposals.pop(anchor_id, None) or [])
+                     if p.get("proposal_id") != proposal_id]
+        if remaining:
+            self.event_proposals[new_segment_id or anchor_id] = remaining
+        if self.proposals_meta:
+            self.proposals_meta["pending"] = sum(
+                len(v) for v in self.event_proposals.values())
 
     def refresh_turn_proposal(self, segment_id: str) -> None:
         """Recompute ONE segment's diarization proposal (id-scoped, cheap).

@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "default: the in-TUI spine picker (choice persists in the sidecar)")
     p.add_argument("--actor", default="human",
                    help="Actor recorded on corrections + review markers")
-    p.add_argument("--lane", choices=("walk", "assign"), default=None,
+    p.add_argument("--lane", choices=("walk", "assign", "propose"), default=None,
                    help="Starting pass lane (multi-lane workbench, DEC cc55a7b5): "
                         "walk = the correction vocabulary, assign = speaker assignment "
                         "(tab cycles in-TUI; default: the sidecar-persisted preference, "
