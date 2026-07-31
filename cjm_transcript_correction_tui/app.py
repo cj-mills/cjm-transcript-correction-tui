@@ -52,6 +52,8 @@ class CorrectionApp(App):
     AUTO_FOCUS = None  # the hidden editor Input must not swallow the walk keys at mount
 
     SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)  # the [ ] playback-rate ladder (0.5/3.0 = the comprehension bounds, drive-round-7 verdict)
+    WORDLESS_INSERT_LABELS = {"inhale", "empty", "throat-clear", "background-noise",
+                              "click", "background-music", "background-voices", "echo"}  # insert classes never meant to carry words (shift-across hop + z fold candidates; DEC a5754fa4; 'empty' = the sole silence term ('dead-air' retired, 8c0aa0bf); background-noise/click adopted 2026-07-30 (phenomenon-true FP labels — bench derives RELABELED, training gets explicit hard negatives); empty-text guard backstops all
 
     NUDGE_STEPS_MS = (1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)  # the { } nudge-step ladder (first drive: 100ms fits some cuts, others need 20/10/5; 1ms added 2026-07-27 — a Chris Wright boundary at ~358.5s outgrew 5ms — granularity is per-BOUNDARY)
 
@@ -136,6 +138,7 @@ class CorrectionApp(App):
         Binding("P", "prev_prune", "prev prune"),
         Binding("F", "gate_editor", "flywheel gate", show=False),
         Binding("enter", "open_source", "open", show=False),
+        Binding("z", "toggle_wordless_fold", "fold ⊕wordless", show=False),
         Binding("escape", "cancel", "cancel/stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
     ]
@@ -186,6 +189,7 @@ class CorrectionApp(App):
         self._pending_proposal = None      # (anchor index, proposal dict) awaiting the propose-split editor hop
         self._ticker = None                # live playback-position timer (the r/R line-up readout)
         self._tick_info = None             # (t0 monotonic, span start, span end, note, speed)
+        self._tick_last = ""               # what the ticker last painted — its ownership receipt (drive asks 2026-07-30)
         self.lane = lane or "walk"         # active pass lane ("walk" | "assign"; tab cycles, sidecar persists)
         self._lane_arg = lane              # explicit --lane (wins over the sidecar; None = defer)
         self._entities: List[Dict[str, Any]] = []  # speaker Entity registry (graph-side, source-spanning)
@@ -193,6 +197,7 @@ class CorrectionApp(App):
         self._accept_cluster: Optional[str] = None  # cluster awaiting its name (the a-gesture's editor hop; None = no accept pending)
         self._shift_busy = False           # in-flight boundary-shift commit (key-repeat throttle)
         self._last_shift = 0.0             # last completed shift (monotonic; paint-rate floor)
+        self.fold_wordless = False         # z: walk/assign passes skip + collapse wordless inserts (sidecar-persisted)
         self._shift_floor = float(shift_floor_s)  # tune with tests_manual/keyrate_probe.py
         self._nudge_step_arg = nudge_step_ms  # explicit --nudge-step-ms (wins over the sidecar; None = defer)
         self._nudge_step = 0.1             # seconds per nudge press (resolved at spine open: flag > sidecar > 100ms)
@@ -289,6 +294,7 @@ class CorrectionApp(App):
         # speaker Entity registry loads once per open (source-spanning, people-scale).
         saved_lane = str(state.get("_lane") or "")
         self.lane = self._lane_arg or (saved_lane if saved_lane in ("walk", "assign") else "walk")
+        self.fold_wordless = bool(state.get("_fold_wordless") or False)
         self._entities = await list_speaker_entities(self.view.queue, self.view.graph_id)
         self._active_entity = None
         self.cursor = 0                    # the picker borrowed the cursor
@@ -316,6 +322,16 @@ class CorrectionApp(App):
         view = self.view
         seg = view.segments[pos]
         gut_w = self._gutter_w
+        if pos != self.cursor and self._folded(pos):
+            # Folded wordless insert (z, DEC fdb93036): one dim line keeps the
+            # spatial context — an inhale bookend needing a nudge stays
+            # spottable — without a full card or a focus stop.
+            lab = view.insert_labels.get(seg.id) or "wordless"
+            row = Text()
+            row.append(f"⊕{seg.index}".ljust(gut_w), style="dim cyan")
+            row.append(f"({lab} · {seg.start_time:.1f}–{seg.end_time:.1f}s)"
+                       if seg.start_time is not None else f"({lab})", style="dim")
+            return [row], 0
         lane_w = max(10, width - gut_w)
         # Corrected-state DERIVES from committed corrections; the manual
         # reviewed verdict is retired (DEC c1bb202f — absence of edits IS the
@@ -486,7 +502,7 @@ class CorrectionApp(App):
         return (f"{head}  ·  edited {edited}{tail}"
                 f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
                 f" · {{}} step · \\[/] speed · e edit · y copy · i/I ⊕insert · x ⊖remove"
-                f" · m/b/M ⚑mark · n/N⚑ p/P✂ jump · F gate · tab assign-lane · q quit")
+                f" · m/b/M ⚑mark · n/N⚑ p/P✂ jump · z fold⊕ · F gate · tab assign-lane · q quit")
 
     def _render_picker(self) -> None:
         """The 2ce81638 discovery stage: the graph's Sources with correction
@@ -586,6 +602,49 @@ class CorrectionApp(App):
         sid, title = self._sources[self.cursor]
         await self._open_source(sid, title)
 
+    def _wordless_insert(self, pos: int) -> bool:
+        """A certified-wordless inserted chunk: wordless CLASS and empty text.
+
+        Label AND text must both agree (DEC a5754fa4): an empty
+        hesitation-marker is NOT wordless — its um lands later, and having
+        hopped it (shift) or hidden it (fold) would misplace that word
+        retroactively."""
+        seg = self.view.segments[pos]
+        return (seg.id in self.view.inserted_ids
+                and not (seg.text or "").strip()
+                and str(self.view.insert_labels.get(seg.id) or "") in self.WORDLESS_INSERT_LABELS)
+
+    def _folded(self, pos: int) -> bool:
+        """Is this position folded away right now? (z toggle; never in the
+        propose lane — pending proposals may anchor to inserted segments)."""
+        return (self.fold_wordless and self.lane != "propose"
+                and self._wordless_insert(pos))
+
+    def action_toggle_wordless_fold(self) -> None:
+        """z: fold/unfold wordless inserts for follow-up passes (drive ask
+        2026-07-30, DEC fdb93036) — folded chunks are skipped by single-step
+        walking (never focused, so never auto-played) and paint as one dim
+        line; explicit jumps still land anywhere. Sidecar-persisted like
+        speed."""
+        if self.view is None or self.stage in ("select", "spine"):
+            return
+        self.fold_wordless = not self.fold_wordless
+        moved = ""
+        if self._folded(self.cursor):
+            for j in (*range(self.cursor + 1, self.view.size),
+                      *range(self.cursor - 1, -1, -1)):
+                if not self._folded(j):
+                    self.cursor = j
+                    moved = f" · cursor → #{self.view.segments[j].index}"
+                    break
+        save_tui_state(self._graph_db_path, self.view.source_id, self.cursor,
+                       fold_wordless=self.fold_wordless)
+        n = sum(1 for p in range(self.view.size) if self._folded(p))
+        self._render()
+        self.query_one("#status", Static).update(
+            f"wordless inserts folded ({n} collapsed) · z unfolds{moved}"
+            if self.fold_wordless else f"wordless inserts unfolded{moved}")
+
     def _start_ticker(self, start_s: float, end_s: float, note: str = "") -> None:
         """Live playback-position readout (drive ask 2026-07-29): while audio
         plays, the status line shows the CURRENT SOURCE TIME so the ear can
@@ -594,6 +653,11 @@ class CorrectionApp(App):
         self-terminates at span end and any new play replaces it."""
         self._stop_ticker()
         self._tick_info = (time.monotonic(), start_s, end_s, note, self.speed)
+        # Claim whatever is on the line as this gesture's paint (seam-decode
+        # readouts etc. precede the ticker), so the first tick may overwrite
+        # it but a LATER gesture's message may not — the ownership receipt
+        # `_tick` checks (drive asks 2026-07-30).
+        self._tick_last = str(self.query_one("#status", Static).content)
         self._ticker = self.set_interval(0.1, self._tick)
 
     def _stop_ticker(self) -> None:
@@ -602,17 +666,29 @@ class CorrectionApp(App):
             self._ticker = None
 
     def _tick(self) -> None:
+        status = self.query_one("#status", Static)
+        if str(status.content) != self._tick_last:
+            # Another gesture painted the line mid-playback (a nudge readout,
+            # a step change, a lane repaint): the ticker YIELDS — audio keeps
+            # sounding, the newer message keeps the line (drive ask
+            # 2026-07-30; ownership = content receipt, no caller refactor).
+            self._stop_ticker()
+            return
         t0, start_s, end_s, note, speed = self._tick_info
         cur = start_s + (time.monotonic() - t0) * speed
         if cur >= end_s:
-            # Span done: hand the status line BACK to the lane (drive find
-            # 2026-07-29 — a stuck readout forced a lane-cycle to clear it).
+            # Span done: LINGER on a final readout until the next gesture
+            # (drive ask 2026-07-30 — short spans vanished before they could
+            # be read; supersedes the 2026-07-29 instant hand-back, whose
+            # intent survives: every gesture repaints or overwrites the
+            # line, so nothing can stick).
             self._stop_ticker()
-            if not self.query_one("#editor", Input).display:
-                self.query_one("#status", Static).update(self._status_line())
+            self._tick_last = (f"■ played {start_s:.2f}–{end_s:.2f}s{note}"
+                               " · any key clears")
+            status.update(self._tick_last)
             return
-        self.query_one("#status", Static).update(
-            f"▶ {cur:.2f}s · span {start_s:.2f}–{end_s:.2f}s{note} · esc stops")
+        self._tick_last = f"▶ {cur:.2f}s · span {start_s:.2f}–{end_s:.2f}s{note} · esc stops"
+        status.update(self._tick_last)
 
     def _play_cursor(self) -> None:
         seg = self.view.segments[self.cursor]
@@ -655,6 +731,13 @@ class CorrectionApp(App):
                 self._render()
             return
         new = max(0, min(self.view.size - 1, self.cursor + delta))
+        if abs(delta) == 1 and self._folded(new):
+            # Single-step walking (keys + wheel) skips folded wordless inserts
+            # (z, DEC fdb93036); explicit jumps (|delta| > 1) still land exactly.
+            probe = new
+            while 0 <= probe < self.view.size and self._folded(probe):
+                probe += delta
+            new = probe if 0 <= probe < self.view.size else self.cursor
         if new == self.cursor:
             return
         self.cursor = new
@@ -1582,13 +1665,15 @@ class CorrectionApp(App):
 
     def action_relabel_insert(self) -> None:
         """L: relabel the inserted chunk under the cursor (drive ask
-        2026-07-29: accepted 'inhale' proposals that turn out to be dead air
-        need a one-gesture reclassification — 'dead-air' tightens speech
-        chunks without polluting the inhale class). Opens the I-editor menu
-        pre-filled with the CURRENT label; commits as supersede + re-insert
-        (same span, same anchors, new label) — no new op vocabulary, and the
-        bench derives it as a RELABELED verdict. Split right halves refuse
-        (their label is structural, x unsplits them)."""
+        2026-07-29: accepted 'inhale' proposals that turn out to be silence
+        need a one-gesture reclassification — 'empty' tightens speech chunks
+        without polluting the inhale class; 'empty' is THE hard-negative
+        term, user-ratified 2026-07-30 over the 'dead-air' synonym, finding
+        8c0aa0bf). Opens the I-editor menu pre-filled with the CURRENT label;
+        commits as supersede + re-insert (same span, same anchors, new
+        label) — no new op vocabulary, and the bench derives it as a
+        RELABELED verdict. Split right halves refuse (their label is
+        structural, x unsplits them)."""
         view = self.view
         seg = view.segments[self.cursor]
         status = self.query_one("#status", Static)
@@ -1759,14 +1844,29 @@ class CorrectionApp(App):
         if i + 1 >= view.size:
             status.update("boundary shift: no segment after the cursor")
             return
-        if view.segments[i].id in view.inserted_ids \
-                or view.segments[i + 1].id in view.inserted_ids:
+        if view.segments[i].id in view.inserted_ids:
             status.update("boundary shift: ✋ inserted chunk — its text lives on the overlay (e edits it)")
             return
-        if view.aseg_index(i) != view.aseg_index(i + 1):
+        # Partner resolution (DEC a5754fa4): hop certified-wordless inserts to
+        # the next LAYER-0 segment — the committed op is the same layer-0
+        # boundary_shift the old x-remove/shift/re-accept dance produced,
+        # without the dance (the moved word's audio was already across the
+        # inserts: FA misplacement, often CAUSED by the intervening event).
+        # A word-bearing insert between still refuses — shifting past it
+        # would reorder spoken words on the effective spine.
+        j = i + 1
+        while j < view.size and self._wordless_insert(j):
+            j += 1
+        if j >= view.size:
+            status.update("boundary shift: no layer-0 segment after the cursor")
+            return
+        if view.segments[j].id in view.inserted_ids:
+            status.update("boundary shift: ✋ word-bearing insert between — its text lives on the overlay (e edits it)")
+            return
+        if view.aseg_index(i) != view.aseg_index(j):
             status.update("boundary shift: ✋ audio-segment seam — text stays within its audio segment")
             return
-        left, right = view.segments[i], view.segments[i + 1]
+        left, right = view.segments[i], view.segments[j]
         plan = plan_boundary_shift(left.text, right.text, direction)
         if plan is None:
             status.update(f"boundary shift: nothing to {direction}")
@@ -1787,7 +1887,7 @@ class CorrectionApp(App):
                 view.unprune_local(prior["id"], amended)
         left.text, right.text = new_left, new_right   # local echo (same math as the layer)
         self._marks[i] = "corrected"
-        self._marks[i + 1] = "corrected"
+        self._marks[j] = "corrected"
         self._render()
 
     async def action_shift_push(self) -> None:
@@ -2044,6 +2144,7 @@ def save_tui_state(
     insert_label: Optional[str] = None,  # Last-used ⊕ insert label (db-wide `_insert_label`; None = leave as-is)
     nudge_step_ms: Optional[float] = None,  # Nudge-step preference (db-wide `_nudge_step_ms`; None = leave as-is)
     lane: Optional[str] = None,      # Pass-lane preference (db-wide `_lane`; None = leave as-is)
+    fold_wordless: Optional[bool] = None,  # z fold preference (db-wide `_fold_wordless`; None = leave as-is)
     skeleton: Optional[str] = None,  # Chosen skeleton-spine selector (per-source; None = leave as-is)
     spines: Optional[int] = None,    # Spine-set size the choice was made against (re-prompt key)
 ) -> None:
@@ -2076,6 +2177,8 @@ def save_tui_state(
         state["_nudge_step_ms"] = float(nudge_step_ms)
     if lane is not None:
         state["_lane"] = str(lane)
+    if fold_wordless is not None:
+        state["_fold_wordless"] = bool(fold_wordless)
     store.write(state)
 
 
