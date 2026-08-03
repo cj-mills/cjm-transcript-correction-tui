@@ -78,6 +78,7 @@ class SpineView:
         self.event_proposals: Dict[str, List[Dict[str, Any]]] = {}  # anchor segment id -> pending event proposals (propose lane; {} = no set)
         self._event_proposals_raw: List[Dict[str, Any]] = []  # The full proposal set (pending DERIVES from this vs spine state)
         self.proposals_meta: Dict[str, Any] = {}      # Proposal-set provenance (set id + model + window) — status strip
+        self.show_tier2: bool = False                 # Audition-tier visibility (t toggles; tier-2 hides by default, 3a5cb858)
         self.skeleton_hash: Optional[str] = None     # THIS spine's identity (None = legacy; the gate's key)
         self.gate: Optional[Dict[str, Any]] = None   # Live extraction-gate assertion (None = in_progress default, DEC 8e05b87b)
         self._aseg_starts: List[float] = []          # AudioSegment starts (sorted, for bisect)
@@ -253,7 +254,11 @@ class SpineView:
                     "proposal_set_id": m.get("proposal_set_id"),
                     "training_run_id": m.get("training_run_id"),
                     "window": m.get("window") or {},
-                    "classes": m.get("classes") or []}
+                    "classes": m.get("classes") or [],
+                    # Dual-tier set (propset 0.2.0, 3a5cb858): the audition
+                    # tier's size, whether or not it is currently shown.
+                    "tier2_total": sum(1 for p in pset["proposals"]
+                                       if int(p.get("tier", 1)) == 2)}
                 self.refresh_event_proposals()
         # cluster-name-once memory: prior accepts journaled their cluster in
         # the proposal snapshot; the projection carries it back (8a4df244).
@@ -458,8 +463,11 @@ class SpineView:
                     if s.id in self.inserted_ids
                     and self.insert_labels.get(s.id)
                     and s.start_time is not None and s.end_time is not None]
-        self.event_proposals = event_span_proposals(
-            self.segments, self._event_proposals_raw, occupied)
+        # Tier gate (3a5cb858): the audition tier joins the pending walk only
+        # when shown; tierless rows are legacy single-tier sets (all tier-1).
+        raw = (self._event_proposals_raw if self.show_tier2 else
+               [p for p in self._event_proposals_raw if int(p.get("tier", 1)) == 1])
+        self.event_proposals = event_span_proposals(self.segments, raw, occupied)
         self.proposals_meta["pending"] = sum(
             len(v) for v in self.event_proposals.values())
 

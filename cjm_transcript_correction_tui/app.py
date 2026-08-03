@@ -53,7 +53,8 @@ class CorrectionApp(App):
 
     SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)  # the [ ] playback-rate ladder (0.5/3.0 = the comprehension bounds, drive-round-7 verdict)
     WORDLESS_INSERT_LABELS = {"inhale", "empty", "throat-clear", "background-noise",
-                              "click", "background-music", "background-voices", "echo"}  # insert classes never meant to carry words (shift-across hop + z fold candidates; DEC a5754fa4; 'empty' = the sole silence term ('dead-air' retired, 8c0aa0bf); background-noise/click adopted 2026-07-30 (phenomenon-true FP labels — bench derives RELABELED, training gets explicit hard negatives); empty-text guard backstops all
+                              "click", "background-music", "background-voices", "echo",
+                              "wheeze"}  # insert classes never meant to carry words (shift-across hop + z fold candidates; DEC a5754fa4; 'empty' = the sole silence term ('dead-air' retired, 8c0aa0bf); background-noise/click adopted 2026-07-30 (phenomenon-true FP labels — bench derives RELABELED, training gets explicit hard negatives); empty-text guard backstops all
 
     NUDGE_STEPS_MS = (1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)  # the { } nudge-step ladder (first drive: 100ms fits some cuts, others need 20/10/5; 1ms added 2026-07-27 — a Chris Wright boundary at ~358.5s outgrew 5ms — granularity is per-BOUNDARY)
 
@@ -79,9 +80,9 @@ class CorrectionApp(App):
         "nudge_start_later", "nudge_step_down", "nudge_step_up",
         "insert_chunk", "insert_labeled", "relabel_insert", "remove_insert", "edit",
         "propose_accept", "propose_next", "propose_prev", "propose_audition",
-        "cycle_lane", "cancel", "quit_app"})
+        "toggle_tier2", "cycle_lane", "cancel", "quit_app"})
     PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
-                                      "propose_audition"})
+                                      "propose_audition", "toggle_tier2"})
 
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
@@ -129,6 +130,7 @@ class CorrectionApp(App):
         Binding("n", "propose_next", "next proposal", show=False),
         Binding("N", "propose_prev", "prev proposal", show=False),
         Binding("R", "propose_audition", "audition proposal", show=False),
+        Binding("t", "toggle_tier2", "tier-2 audition", show=False),
         Binding("m", "mark_quick", "mark"),
         Binding("b", "mark_boundary", "mark boundary"),
         Binding("M", "mark_editor", "mark+class"),
@@ -385,8 +387,11 @@ class CorrectionApp(App):
             if props:
                 p = props[0]
                 extra = f"×{len(props)}" if len(props) > 1 else ""
-                chip = Text(f"?{p.get('label')} {float(p.get('score') or 0):.2f}{extra} ▏",
-                            style="dim cyan")
+                # ?? = audition tier (below the operating point, 3a5cb858) —
+                # quieter mark, same accept gesture.
+                q = "??" if int(p.get("tier", 1)) == 2 else "?"
+                chip = Text(f"{q}{p.get('label')} {float(p.get('score') or 0):.2f}{extra} ▏",
+                            style="dim magenta" if q == "??" else "dim cyan")
                 chip.append_text(body)
                 body = chip
         if abs(pos - self.cursor) > 1 and seg.text:
@@ -492,10 +497,14 @@ class CorrectionApp(App):
         if self.lane == "propose":
             meta = view.proposals_meta or {}
             pending = meta.get("pending", 0)
-            return (f"{head}  ·  proposals {pending} pending"
+            t2 = meta.get("tier2_total", 0)
+            tier2 = (f" · tier2 {t2} {'shown' if view.show_tier2 else 'hidden'}"
+                     if t2 else "")
+            return (f"{head}  ·  proposals {pending} pending{tier2}"
                     f" · set {str(meta.get('proposal_set_id') or '')[-8:]}"
                     f" · model {str(meta.get('training_run_id') or '')[-8:]}{tail}"
-                    f"  ·  a accept · n/N jump · R proposal · r chunk · ,./<> nudge"
+                    f"  ·  a accept · n/N jump · R proposal{' · t tier2' if t2 else ''}"
+                    f" · r chunk · ,./<> nudge"
                     f" · i/I manual · L relabel · x remove · e edit · j/k walk"
                     f" · g/G seam · tab lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
@@ -1244,6 +1253,25 @@ class CorrectionApp(App):
         self.query_one("#status", Static).update(
             f"@ #{idx} → {self._entity_name(entity_id)}")
 
+    def action_toggle_tier2(self) -> None:
+        """t (propose lane): show/hide the audition tier (3a5cb858 shape A).
+
+        Tier-2 spans are the model's below-threshold catches — audition-only,
+        never carve cuts. Hidden by default so the primary walk stays the
+        operating-point contract; shown, they join the pending walk and ride
+        the SAME accept machinery (an accept is bench data at its tier)."""
+        view = self.view
+        status = self.query_one("#status", Static)
+        if not (view.proposals_meta or {}).get("tier2_total"):
+            status.update("single-tier proposal set — no audition tier to show")
+            return
+        view.show_tier2 = not view.show_tier2
+        view.refresh_event_proposals()
+        self._render()
+        t2 = (view.proposals_meta or {}).get("tier2_total", 0)
+        status.update(f"audition tier shown ({t2} tier-2 spans join the walk) · t hides"
+                      if view.show_tier2 else "audition tier hidden · t shows")
+
     async def action_propose_accept(self) -> None:
         """a (propose lane): accept the cursor anchor's first pending proposal.
 
@@ -1364,6 +1392,20 @@ class CorrectionApp(App):
         plan = plan_chunk_split(view.segments, i, caret, text=value,
                                 inserted_ids=view.inserted_ids)
         if plan is None:
+            # Caret at an extreme is the BOOKEND signal (drive find 2026-07-31,
+            # source-1 pass 2): an interior-classified span that in fact hugs
+            # a chunk edge (stopped short of it beyond eps — FA edge drift)
+            # has no dividable text on one side. All words LEFT of the caret =
+            # end-bookend; all RIGHT = start-bookend. Resolve as the straddle
+            # shape does — pull the edge clear, land the insert; no split.
+            left_words = value[:caret].split()
+            right_words = value[caret:].split()
+            if left_words and not right_words:
+                await self._accept_bookend(i, p, "end")
+                return
+            if right_words and not left_words:
+                await self._accept_bookend(i, p, "start")
+                return
             self._render()
             status.update("accept: split refused (the caret must leave words "
                           "on both sides of the cut)")
@@ -1420,6 +1462,58 @@ class CorrectionApp(App):
         self.player.stop()
         self.run_worker(self._play_source_span(
             ps, pe, note=f" · ✓ {p.get('label')} isolated (split + insert)"))
+
+    async def _accept_bookend(self, i: int, p: Dict[str, Any], edge: str) -> None:
+        """Resolve a caret-at-extreme propose-accept as a BOOKEND accept
+        (drive find 2026-07-31): the span sits strictly inside the anchor's
+        recorded time yet the driver marked every word on one side — the
+        event hugs that edge in fact, the chunk's recorded edge just drifted
+        past it. Same three-part shape as the straddle accept: pull the edge
+        clear of the span (the pull is the edit record the bench reads),
+        land the labeled insert in the seam, replay the span."""
+        view = self.view
+        status = self.query_one("#status", Static)
+        seg = view.segments[i]
+        ps, pe = float(p["start_time"]), float(p["end_time"])
+        seam = i if edge == "end" else i - 1
+        if seam < 0:
+            self._render()
+            status.update("accept: no seam before the first segment — "
+                          "i inserts manually")
+            return
+        plan = plan_chunk_insert(view.segments, seam, inserted_ids=view.inserted_ids,
+                                 insert_ranks=view.insert_ranks)
+        if plan is None:
+            self._render()
+            status.update("accept: refused (missing times, or an overlapping "
+                          "boundary — nudge the overlap first)")
+            return
+        words = (seg.text or "").split() or [None]
+        if edge == "end":
+            await self._commit_span_nudge(seg.id, "end", float(seg.end_time), ps,
+                                          {"left": words[-1], "right": None})
+        else:
+            await self._commit_span_nudge(seg.id, "start", float(seg.start_time), pe,
+                                          {"left": None, "right": words[0]})
+        insert_id = await commit_chunk_insert_correction(
+            view.queue, view.graph_id, view.source_id,
+            plan["after_id"], ps, pe, self.session_id,
+            before_segment_id=plan["before_id"], label=p.get("label"),
+            rank=plan["rank"], actor=self.actor, journal_path=self._journal_path)
+        pos = view.add_insert_local(
+            {"id": insert_id,
+             "payload": {"operation": "chunk_insert",
+                         "after_segment_id": plan["after_id"],
+                         "start_time": ps, "end_time": pe,
+                         "label": p.get("label"), "text": "", "rank": plan["rank"]}})
+        if pos is not None:
+            self._marks = {(k + 1 if k >= pos else k): v for k, v in self._marks.items()}
+            self.cursor = pos
+        view.refresh_event_proposals()  # the accepted span now occupies — pending re-derives
+        self._render()
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            ps, pe, note=f" · ✓ {p.get('label')} accepted · anchor {edge} pulled"))
 
     async def _commit_span_nudge(self, segment_id: str, edge: str, old_t: float,
                                  new_t: float, words: Dict[str, Any]) -> None:
