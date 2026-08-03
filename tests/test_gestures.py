@@ -778,3 +778,26 @@ def test_overlay_at_cursor_targeting():
     app._word_cursor = 1                       # on "I" — nothing covers it
     assert app._overlay_at_cursor(seg)["id"] == "o2"          # newest-fallback (nudge/remove)
     assert app._overlay_at_cursor(seg, covering_only=True) is None  # audition previews instead
+
+
+def test_neighbor_word_bound_overshoot_guard_data():
+    """The overlay-nudge advisory's data (pure): the facing FA boundary of the
+    span's in-segment neighbor; None off the segment edge or when the
+    neighbor's time is not FA-anchored (estimation is no guard)."""
+    from cjm_transcript_correction_tui.spine import neighbor_word_bound, segment_word_tokens
+    text = "uh in your"
+    toks = segment_word_tokens(text)
+    # FA aligned the pre-edit text — "uh" has no row (the restored-word case)
+    fa = [{"s": 32.60, "e": 32.75, "text": "in"},
+          {"s": 32.75, "e": 33.10, "text": "your"}]
+    span = (0, 2)  # the "uh" anchor's char range
+    # growing the end: the guard boundary is "in"'s FA start
+    assert neighbor_word_bound(toks, *span, "next", 32.3, 33.5, len(text), fa) == ("in", 32.60)
+    # shrinking toward the head: no in-segment word before "uh"
+    assert neighbor_word_bound(toks, *span, "prev", 32.3, 33.5, len(text), fa) is None
+    # a span on "your": prev neighbor "in" faces with its FA END
+    span_your = (toks[2][0], toks[2][1])
+    assert neighbor_word_bound(toks, *span_your, "prev", 32.3, 33.5, len(text), fa) == ("in", 32.75)
+    assert neighbor_word_bound(toks, *span_your, "next", 32.3, 33.5, len(text), fa) is None
+    # no FA cache -> every neighbor estimates -> no guard data
+    assert neighbor_word_bound(toks, *span, "next", 32.3, 33.5, len(text), None) is None

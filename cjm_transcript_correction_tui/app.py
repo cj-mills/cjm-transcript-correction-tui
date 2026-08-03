@@ -32,10 +32,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_entity_input,
-                    parse_mark_input, plan_boundary_shift, plan_chunk_insert, plan_chunk_split,
-                    plan_gate, plan_time_nudge, resolve_mark_class_token, segment_word_tokens,
-                    snap_word_span, source_status, SpineView)
+from .spine import (list_sources, load_source_slice, match_sources, neighbor_word_bound, open_stack,
+                    parse_entity_input, parse_mark_input, plan_boundary_shift, plan_chunk_insert,
+                    plan_chunk_split, plan_gate, plan_time_nudge, resolve_mark_class_token,
+                    segment_word_tokens, snap_word_span, source_status, SpineView)
 
 
 class CorrectionApp(App):
@@ -2596,6 +2596,24 @@ class CorrectionApp(App):
                           "collapse the span)")
             return
         anchor = dict(p.get("anchor") or {})
+        # Overshoot ADVISORY (drive ask 2026-08-03): flag a span edge crossing
+        # the adjacent word's FA boundary — a hesitation often leads straight
+        # into the next word, and a 10ms overshoot is inaudible in the replay.
+        # A warning, never a clamp: FA edges drift (the 41abdde9 class), so
+        # the ear keeps final authority over the machine time.
+        warn = ""
+        toks = segment_word_tokens(seg.text)
+        if toks and seg.start_time is not None and seg.end_time is not None:
+            nb = neighbor_word_bound(
+                toks, int(anchor.get("char_start") or 0),
+                int(anchor.get("char_end") or 0),
+                "next" if edge == "end" else "prev",
+                float(seg.start_time), float(seg.end_time), len(seg.text),
+                await self._fa_words_for(seg))
+            if nb is not None:
+                over = (new_end - nb[1]) if edge == "end" else (nb[1] - new_start)
+                if over > 1e-3:
+                    warn = f" · ⚠ into “{nb[0]}” +{over * 1000:.0f}ms"
         overlay_id = await commit_speech_overlay_correction(
             view.queue, view.graph_id, view.source_id, anchor,
             str(p.get("label")), new_start, new_end, str(p.get("text") or ""),
@@ -2611,7 +2629,7 @@ class CorrectionApp(App):
         self.player.stop()
         self.run_worker(self._play_source_span(
             new_start, new_end,
-            note=f" · ◈ {p.get('label')} {edge} {delta:+.3f}s"))
+            note=f" · ◈ {p.get('label')} {edge} {delta:+.3f}s{warn}"))
 
     async def action_overlay_remove(self) -> None:
         """x (annotate lane): remove an overlay on the cursor segment — the one

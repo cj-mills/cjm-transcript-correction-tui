@@ -1074,6 +1074,41 @@ def snap_word_span(
     return s, max(e, s + 0.01), "estimated", []
 
 
+def neighbor_word_bound(
+    tokens: List[Tuple[int, int, str]],  # segment_word_tokens output
+    char_start: int,                     # The span anchor's char_start
+    char_end: int,                       # The span anchor's char_end
+    side: str,                           # "next" (word after the span) | "prev" (word before)
+    seg_start: float,                    # Segment effective start (source seconds)
+    seg_end: float,                      # Segment effective end (source seconds)
+    text_len: int,                       # len(segment text)
+    fa_words: Optional[List[Dict[str, Any]]],  # Transcript FA words (source seconds)
+) -> Optional[Tuple[str, float]]:  # (word, its facing FA boundary time); None = no FA-anchored neighbor
+    """The adjacent word's FA boundary facing an overlay span (pure).
+
+    The overlay-nudge overshoot guard's data: `next` returns the following
+    word and its FA START (the time a growing span end crosses into it);
+    `prev` the preceding word and its FA END. None when the span has no
+    in-segment neighbor on that side or the neighbor's time is not FA-anchored
+    (snap != fa-word) — an estimated time is no guard, and the WARNING stays
+    advisory either way: FA edges drift (the 41abdde9 class), so the ear
+    keeps final authority and nothing refuses."""
+    if side == "next":
+        idx = next((i for i, (cs, _, _) in enumerate(tokens) if cs >= char_end), None)
+    elif side == "prev":
+        idx = next((i for i in range(len(tokens) - 1, -1, -1)
+                    if tokens[i][1] <= char_start), None)
+    else:
+        return None
+    if idx is None:
+        return None
+    snapped = snap_word_span(tokens, idx, idx, seg_start, seg_end, text_len, fa_words)
+    if snapped is None or snapped[2] != "fa-word":
+        return None
+    word = tokens[idx][2]
+    return (word, snapped[0]) if side == "next" else (word, snapped[1])
+
+
 def plan_gate(
     raw: str,                            # The F-editor submission: `w [sec]` | `signoff` | `exclude` | `resume`
     cursor_end_s: Optional[float],       # The cursor segment's effective end (the pause point)
