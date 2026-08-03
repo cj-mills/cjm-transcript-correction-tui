@@ -696,15 +696,24 @@ def test_annotate_lane_gate_and_selection_range():
     app.stage = "correct"
     app.lane = "annotate"
     for a in ("word_left", "word_select", "annotate_pick", "annotate_quick",
-              "overlay_remove", "next_overlay", "next", "replay", "cycle_lane"):
+              "overlay_remove", "overlay_nudge", "nudge_step_up", "next_overlay",
+              "next", "replay", "cycle_lane", "cycle_lane_prev"):
         assert app.check_action(a, ()), a
     for a in ("edit", "insert_chunk", "mark_quick", "shift_push", "split_chunk",
-              "remove_insert", "assign_pick", "propose_accept"):
+              "remove_insert", "assign_pick", "propose_accept",
+              "nudge_end_earlier"):
         assert not app.check_action(a, ()), a
     app.lane = "walk"
-    for a in ("word_left", "annotate_pick", "annotate_quick", "overlay_remove"):
+    for a in ("word_left", "annotate_pick", "annotate_quick", "overlay_remove",
+              "overlay_nudge"):
         assert not app.check_action(a, ()), a
     assert app.check_action("edit", ()) and app.check_action("remove_insert", ())
+    # shift+tab (reverse cycle) is live in every lane; the boundary time-nudge
+    # verbs stay walk/propose vocabulary — overlay spans refine by supersede
+    for lane in ("walk", "assign", "propose"):
+        app.lane = lane
+        assert app.check_action("cycle_lane_prev", ()), lane
+    app.lane = "walk"
     # selection: cursor-word when unanchored, inclusive clamped range when anchored
     app._word_cursor, app._word_anchor = 2, None
     assert app._selection_range(3) == (2, 2)

@@ -73,7 +73,7 @@ class CorrectionApp(App):
     ASSIGN_LANE_ACTIONS = frozenset({
         "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
         "yank", "assign_pick", "assign_same", "assign_new", "assign_accept",
-        "cycle_lane", "cancel", "quit_app"})
+        "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
     ASSIGN_ONLY_ACTIONS = frozenset({"assign_pick", "assign_same", "assign_new",
                                      "assign_accept"})
 
@@ -87,7 +87,7 @@ class CorrectionApp(App):
         "nudge_start_later", "nudge_step_down", "nudge_step_up",
         "insert_chunk", "insert_labeled", "relabel_insert", "remove_insert", "edit",
         "propose_accept", "propose_next", "propose_prev", "propose_audition",
-        "toggle_tier2", "cycle_lane", "cancel", "quit_app"})
+        "toggle_tier2", "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
     PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
                                       "propose_audition", "toggle_tier2"})
 
@@ -100,11 +100,12 @@ class CorrectionApp(App):
         "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
         "yank", "word_left", "word_right", "word_select", "annotate_quick",
         "annotate_pick", "annotate_editor", "annotate_audition", "overlay_remove",
+        "overlay_nudge", "nudge_step_down", "nudge_step_up",
         "next_overlay", "prev_overlay", "toggle_wordless_fold",
-        "cycle_lane", "cancel", "quit_app"})
+        "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
     ANNOTATE_ONLY_ACTIONS = frozenset({
         "word_left", "word_right", "word_select", "annotate_quick", "annotate_pick",
-        "annotate_editor", "annotate_audition", "overlay_remove",
+        "annotate_editor", "annotate_audition", "overlay_remove", "overlay_nudge",
         "next_overlay", "prev_overlay"})
 
     CSS = """
@@ -125,6 +126,10 @@ class CorrectionApp(App):
         Binding("full_stop", "nudge_end_later", "nudge +", key_display="."),
         Binding("less_than_sign", "nudge_start_earlier", "start −", show=False),
         Binding("greater_than_sign", "nudge_start_later", "start +", show=False),
+        Binding("comma", "overlay_nudge('end', -1)", show=False),
+        Binding("full_stop", "overlay_nudge('end', 1)", show=False),
+        Binding("less_than_sign", "overlay_nudge('start', -1)", show=False),
+        Binding("greater_than_sign", "overlay_nudge('start', 1)", show=False),
         Binding("left_curly_bracket", "nudge_step_down", "step −", show=False, key_display="{"),
         Binding("right_curly_bracket", "nudge_step_up", "step +", show=False, key_display="}"),
         Binding("left_square_bracket", "speed_down", "slower", key_display="["),
@@ -141,6 +146,7 @@ class CorrectionApp(App):
         Binding("left", "shift_pull", "pull word", key_display="←"),
         Binding("a", "shift_pull", "pull word", show=False),
         Binding("tab", "cycle_lane", "lane", show=False, priority=True),
+        Binding("shift+tab", "cycle_lane_prev", "lane ←", show=False, priority=True),
         Binding("space", "assign_same", "same speaker", show=False),
         Binding("A", "assign_new", "new speaker", show=False),
         Binding("a", "assign_accept", "accept cluster", show=False),
@@ -580,7 +586,7 @@ class CorrectionApp(App):
             return (f"{head}  ·  ◈ {view.overlay_count}{sel_txt}"
                     f"  ·  label: {self._overlay_label}{tail}"
                     f"  ·  h/l·←→ word · v range · space ◈commit · 1-9 class"
-                    f" · A class+ · R audition · x remove · n/N ◈ jump"
+                    f" · A class+ · R audition · ,./<> ◈nudge · x remove · n/N ◈ jump"
                     f" · j/k walk · r replay · tab lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
         return (f"{head}  ·  edited {edited}{tail}"
@@ -1121,12 +1127,25 @@ class CorrectionApp(App):
         editor guard keeps a priority tab from hijacking an open edit."""
         if self.query_one("#editor", Input).display:
             return
+        self._cycle_lane(1)
+
+    def action_cycle_lane_prev(self) -> None:
+        """shift+tab: cycle the pass lane BACKWARD (drive ask 2026-08-03 — the
+        walk<->annotate two-step of restore-then-annotate sits at opposite
+        ends of the forward rotation). Same gate, editor guard, and sidecar
+        persistence as tab; priority=True for the same Screen-shadowing
+        reason (Screen binds shift+tab to focus_previous)."""
+        if self.query_one("#editor", Input).display:
+            return
+        self._cycle_lane(-1)
+
+    def _cycle_lane(self, delta: int) -> None:
         # walk -> assign -> [propose ->] annotate -> walk; the propose lane only
         # enters the rotation when a proposal set loaded (no set = the walk
         # stays manual); the annotate lane is always available (fc42614d).
         order = (["walk", "assign"] + (["propose"] if self.view.proposals_meta else [])
                  + ["annotate"])
-        self.lane = order[(order.index(self.lane) + 1) % len(order)] \
+        self.lane = order[(order.index(self.lane) + delta) % len(order)] \
             if self.lane in order else "walk"
         self._word_anchor = None
         save_tui_state(self._graph_db_path, self.view.source_id, None, lane=self.lane)
@@ -2512,19 +2531,13 @@ class CorrectionApp(App):
             rec["start_time"], rec["end_time"],
             note=f" · ◈ {label} “{rec['text'][:24]}” ({rec['snap']})"))
 
-    async def action_overlay_remove(self) -> None:
-        """x (annotate lane): remove an overlay on the cursor segment — the one
-        covering the word cursor when there is one, else the newest
-        (reject-as-supersede, the mark-dismissal shape)."""
-        view = self.view
-        seg = view.segments[self.cursor]
-        status = self.query_one("#status", Static)
-        overlays = view.overlays_for(seg.id)
+    def _overlay_at_cursor(self, seg) -> Optional[Dict[str, Any]]:
+        """The gesture-target overlay on the cursor segment: the one covering
+        the word cursor when there is one, else the newest; None = no ◈."""
+        overlays = self.view.overlays_for(seg.id)
         if not overlays:
-            status.update("annotate: no ◈ overlay on this segment")
-            return
+            return None
         toks = segment_word_tokens(seg.text)
-        target = None
         if toks:
             c = max(0, min(len(toks) - 1, self._word_cursor))
             cs, ce = toks[c][0], toks[c][1]
@@ -2532,9 +2545,68 @@ class CorrectionApp(App):
                 a = (o.get("payload") or {}).get("anchor") or {}
                 if a.get("char_start") is not None and a.get("char_end") is not None \
                         and int(a["char_start"]) <= cs and ce <= int(a["char_end"]):
-                    target = o
-                    break
-        target = target or overlays[-1]
+                    return o
+        return overlays[-1]
+
+    async def action_overlay_nudge(self, edge: str, sign: int) -> None:
+        """,/. (span END) and </> (span START) in the annotate lane: nudge the
+        cursor overlay's TIME span by ±the { } ladder step — the fc42614d
+        refinement half (snap-to-word derives, nudges refine; drive ask
+        2026-08-03: an estimated 'uh' span needed its tail grown).
+
+        Refinement is a SUPERSEDE + re-commit (same anchor/label/text/words,
+        new times, snap="nudged" — human-refined provenance the bench can
+        split from machine snaps): overlays are samples, never spine timing,
+        so the time-nudge verb stays out of it and the supersede CHAIN is the
+        refinement record. The adjusted span replays at once (the immediate-
+        audible-verification regime)."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        target = self._overlay_at_cursor(seg)
+        if target is None:
+            status.update("annotate: no ◈ overlay here to nudge (v+label commits one first)")
+            return
+        p = target.get("payload") or {}
+        start, end = float(p["start_time"]), float(p["end_time"])
+        delta = sign * self._nudge_step
+        if edge == "end":
+            new_start, new_end = start, end + delta
+        else:
+            new_start, new_end = max(0.0, start + delta), end
+        if new_end - new_start < 0.005:
+            status.update(f"annotate: nudge refused ({edge} {delta:+.3f}s would "
+                          "collapse the span)")
+            return
+        anchor = dict(p.get("anchor") or {})
+        overlay_id = await commit_speech_overlay_correction(
+            view.queue, view.graph_id, view.source_id, anchor,
+            str(p.get("label")), new_start, new_end, str(p.get("text") or ""),
+            self.session_id, words=list(p.get("words") or []), snap="nudged",
+            supersedes_id=target["id"], actor=self.actor,
+            journal_path=self._journal_path)
+        view.remove_overlay_local(target["id"])
+        view.add_overlay_local({"id": overlay_id, "correction_type": "annotation",
+                                "payload": {**p, "anchor": anchor,
+                                            "start_time": new_start,
+                                            "end_time": new_end, "snap": "nudged"}})
+        self._render()
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            new_start, new_end,
+            note=f" · ◈ {p.get('label')} {edge} {delta:+.3f}s"))
+
+    async def action_overlay_remove(self) -> None:
+        """x (annotate lane): remove an overlay on the cursor segment — the one
+        covering the word cursor when there is one, else the newest
+        (reject-as-supersede, the mark-dismissal shape)."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        target = self._overlay_at_cursor(seg)
+        if target is None:
+            status.update("annotate: no ◈ overlay on this segment")
+            return
         await commit_speech_overlay_removal(
             view.queue, view.graph_id, view.source_id, target["id"],
             self.session_id, actor=self.actor, journal_path=self._journal_path)
