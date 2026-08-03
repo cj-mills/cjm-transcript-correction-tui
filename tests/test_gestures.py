@@ -651,3 +651,90 @@ def test_plan_gate_grammar():
     assert plan_gate("w abc", 1.0, 2.0, None) is None       # non-numeric override
     assert plan_gate("w", None, 2.0, None) is None          # no time to anchor
     assert plan_gate("signoff", 1.0, None, None) is None    # no source end
+
+
+def test_segment_word_tokens_offsets():
+    """The annotate lane's selection unit: whitespace words WITH char offsets."""
+    from cjm_transcript_correction_tui.spine import segment_word_tokens
+    assert segment_word_tokens("um I  mean") == [(0, 2, "um"), (3, 4, "I"), (6, 10, "mean")]
+    assert segment_word_tokens("") == [] and segment_word_tokens("   ") == []
+
+
+def test_snap_word_span_direct_fuzzy_and_estimated():
+    """fc42614d: the span DERIVES from FA word times — equal counts map by
+    position, edited text aligns by normalized tokens, no cache estimates."""
+    from cjm_transcript_correction_tui.spine import segment_word_tokens, snap_word_span
+    toks = segment_word_tokens("um I mean")
+    fa = [{"s": 10.0, "e": 10.3, "text": "um"},
+          {"s": 10.35, "e": 10.5, "text": "i"},
+          {"s": 10.6, "e": 11.0, "text": "mean"}]
+    # direct positional map (counts equal; punctuation/case-insensitive)
+    s, e, snap, hit = snap_word_span(toks, 0, 1, 10.0, 11.0, len("um I mean"), fa)
+    assert (s, e, snap) == (10.0, 10.5, "fa-word") and len(hit) == 2
+    # fuzzy: the effective text carries an extra edited word FA never saw
+    toks2 = segment_word_tokens("um I really mean")
+    s, e, snap, hit = snap_word_span(toks2, 2, 3, 10.0, 11.0, len("um I really mean"), fa)
+    assert snap == "fa-word" and (s, e) == (10.6, 11.0)   # 'mean' matched, range clips to it
+    # no cache -> char-fraction estimation (the split-seed regime)
+    s, e, snap, hit = snap_word_span(toks, 0, 0, 10.0, 11.0, len("um I mean"), None)
+    assert snap == "estimated" and hit == [] and 10.0 <= s < e <= 11.0
+    # words outside the segment window are not candidates (window filter)
+    far = [{"s": 50.0, "e": 50.5, "text": "um"}]
+    assert snap_word_span(toks, 0, 0, 10.0, 11.0, 9, far)[2] == "estimated"
+    # refusals: no tokens / bad range / collapsed span
+    assert snap_word_span([], 0, 0, 10.0, 11.0, 9, fa) is None
+    assert snap_word_span(toks, 2, 1, 10.0, 11.0, 9, fa) is None
+    assert snap_word_span(toks, 0, 0, 11.0, 11.0, 9, fa) is None
+
+
+def test_annotate_lane_gate_and_selection_range():
+    """The annotate lane scopes its vocabulary through the one check_action
+    gate (fc42614d): annotate-only actions are inert in the walk lane, the
+    walk verbs that would mutate the spine are inert in the annotate lane."""
+    from cjm_transcript_correction_tui.app import CorrectionApp
+    app = CorrectionApp()
+    app.stage = "correct"
+    app.lane = "annotate"
+    for a in ("word_left", "word_select", "annotate_pick", "annotate_quick",
+              "overlay_remove", "next_overlay", "next", "replay", "cycle_lane"):
+        assert app.check_action(a, ()), a
+    for a in ("edit", "insert_chunk", "mark_quick", "shift_push", "split_chunk",
+              "remove_insert", "assign_pick", "propose_accept"):
+        assert not app.check_action(a, ()), a
+    app.lane = "walk"
+    for a in ("word_left", "annotate_pick", "annotate_quick", "overlay_remove"):
+        assert not app.check_action(a, ()), a
+    assert app.check_action("edit", ()) and app.check_action("remove_insert", ())
+    # selection: cursor-word when unanchored, inclusive clamped range when anchored
+    app._word_cursor, app._word_anchor = 2, None
+    assert app._selection_range(3) == (2, 2)
+    app._word_anchor = 0
+    assert app._selection_range(3) == (0, 2)
+    app._word_cursor = 99          # clamps
+    assert app._selection_range(3) == (0, 2)
+    assert app._selection_range(0) is None
+
+
+def test_spineview_overlay_bookkeeping():
+    """SpineView overlay state: echoes recompute the ◈ set, per-segment lookup
+    is anchor-scoped, labels/count derive from the ACTIVE overlays."""
+    from cjm_transcript_correction_tui.spine import SpineView
+    view = SpineView.__new__(SpineView)
+    view._overlays = []
+    view._recompute_overlay_ids()
+    assert view.overlay_ids == set() and view.overlay_count == 0
+    o1 = {"id": "o1", "correction_type": "annotation",
+          "payload": {"operation": "speech_overlay", "label": "hesitation-marker",
+                      "anchor": {"kind": "span", "segment_id": "a",
+                                 "char_start": 0, "char_end": 2, "text_snapshot": "um"}}}
+    o2 = {"id": "o2", "correction_type": "annotation",
+          "payload": {"operation": "speech_overlay", "label": "word-repeat",
+                      "anchor": {"kind": "span", "segment_id": "b",
+                                 "char_start": 3, "char_end": 7, "text_snapshot": "very"}}}
+    view.add_overlay_local(o1)
+    view.add_overlay_local(o2)
+    assert view.overlay_ids == {"a", "b"} and view.overlay_count == 2
+    assert [o["id"] for o in view.overlays_for("a")] == ["o1"]
+    assert view.seen_overlay_labels == ["hesitation-marker", "word-repeat"]
+    view.remove_overlay_local("o1")
+    assert view.overlay_ids == {"b"} and view.overlays_for("a") == []

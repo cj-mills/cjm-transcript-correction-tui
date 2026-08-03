@@ -1,8 +1,10 @@
 import asyncio
 import os
+import re
 import shutil
 from bisect import bisect_right
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,10 +17,10 @@ from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_transcript_correction_core.cli import load_capabilities
 from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
-                                                  list_source_spines, load_extraction_gates,
-                                                  load_source_corrections, load_source_segments,
-                                                  mark_anchor_segments, open_marks,
-                                                  project_effective_spine,
+                                                  active_speech_overlays, list_source_spines,
+                                                  load_extraction_gates, load_source_corrections,
+                                                  load_source_segments, mark_anchor_segments,
+                                                  open_marks, project_effective_spine,
                                                   resolve_source_renditions, skeleton_hash_for)
 from cjm_transcript_correction_core.models import SpineSegment
 from cjm_transcript_correction_core.signals import (event_span_proposals, load_event_proposal_set,
@@ -66,6 +68,8 @@ class SpineView:
         self._open_marks: List[dict] = []            # OPEN mark Corrections (routed attention)
         self.marked_ids: set = set()                 # Segment ids an open mark anchors (⚑ glyphs)
         self.seen_mark_classes: List[str] = []       # DISTINCT classes journaled on this source (open or discharged)
+        self._overlays: List[dict] = []              # ACTIVE speech-overlay Corrections (word-span samples, fc42614d)
+        self.overlay_ids: set = set()                # Segment ids carrying an active overlay (◈ glyphs)
         self.inserted_ids: set = set()               # Synthetic chunk-insert segment ids (⊕ paint + gesture routing)
         self.insert_labels: Dict[str, Optional[str]] = {}  # insert id -> annotation label
         self.insert_ranks: Dict[str, float] = {}     # insert id -> stack rank (walked-order tie-break, 131ba57a)
@@ -148,6 +152,11 @@ class SpineView:
         # (corrections_to_edits has no arm for correction_type "mark" — DEC 2a231843).
         self._open_marks = open_marks(corrections, superseded)
         self._recompute_marked_ids()
+        # Active speech overlays (the annotate lane's sample layer, fc42614d):
+        # word-span samples OVER speech — like marks, they never touch the
+        # projection; the ◈ glyph and the annotate lane surface them.
+        self._overlays = active_speech_overlays(corrections, superseded)
+        self._recompute_overlay_ids()
         # Active speaker assignments (attribute overlay — never touches text/times):
         # the assign lane paints + corrects these (DEC d6df3a8e / 8a4df244).
         self.speakers = active_speaker_assignments(corrections, superseded)
@@ -410,6 +419,42 @@ class SpineView:
         """Local echo of a mark dismissal."""
         self._open_marks = [m for m in self._open_marks if m.get("id") != mark_id]
         self._recompute_marked_ids()
+
+    def _recompute_overlay_ids(self) -> None:
+        """Re-derive the ◈ id set from the active overlays (load + local echoes)."""
+        self.overlay_ids = {
+            str(((o.get("payload") or {}).get("anchor") or {}).get("segment_id"))
+            for o in self._overlays
+            if ((o.get("payload") or {}).get("anchor") or {}).get("segment_id")}
+
+    def overlays_for(self, segment_id: str) -> List[dict]:
+        """The active speech overlays anchored to a segment (oldest first)."""
+        return [o for o in self._overlays
+                if ((o.get("payload") or {}).get("anchor") or {}).get("segment_id")
+                == segment_id]
+
+    def add_overlay_local(self, overlay: dict) -> None:
+        """Local echo of a committed speech overlay (the ◈ paints without a reload)."""
+        self._overlays.append(overlay)
+        self._recompute_overlay_ids()
+
+    def remove_overlay_local(self, overlay_id: str) -> None:
+        """Local echo of a speech-overlay removal (reject-as-supersede)."""
+        self._overlays = [o for o in self._overlays if o.get("id") != overlay_id]
+        self._recompute_overlay_ids()
+
+    @property
+    def overlay_count(self) -> int:  # Active speech overlays on this source
+        """How many overlay samples this source carries (status-strip counter)."""
+        return len(self._overlays)
+
+    @property
+    def seen_overlay_labels(self) -> List[str]:
+        """DISTINCT labels on this source's ACTIVE overlays (the digit menu's
+        observed tier — the seen_mark_classes semantics)."""
+        return sorted({str((o.get("payload") or {}).get("label"))
+                       for o in self._overlays
+                       if (o.get("payload") or {}).get("label")})
 
     def set_gate_local(self, gate: Dict[str, Any]) -> None:
         """Local echo of a committed extraction-gate assertion (latest-wins:
@@ -953,6 +998,80 @@ def plan_chunk_split(
             "end_s": end,
             "boundary_words": {"left": left_text.split()[-1],
                                "right": right_text.split()[0]}}
+
+
+def segment_word_tokens(
+    text: str,  # A segment's effective text
+) -> List[Tuple[int, int, str]]:  # [(char_start, char_end, word)] in text order
+    """Tokenize a segment's text into words WITH character offsets (pure).
+
+    The annotate lane's selection unit: the word cursor walks these tokens,
+    and a committed overlay's span anchor records the token range's char
+    offsets (whitespace splitting — the same unit the shift/split gestures
+    use)."""
+    return [(m.start(), m.end(), m.group()) for m in re.finditer(r"\S+", text or "")]
+
+
+def _norm_token(t: str) -> str:  # Case/punctuation-insensitive comparison form
+    """Normalize one token for FA-word matching (FA words carry no punctuation)."""
+    return "".join(ch for ch in t.lower() if ch.isalnum())
+
+
+def snap_word_span(
+    tokens: List[Tuple[int, int, str]],  # segment_word_tokens output
+    sel_a: int,                          # Selection start (token index, inclusive)
+    sel_b: int,                          # Selection end (token index, inclusive)
+    seg_start: float,                    # Segment effective start (source seconds)
+    seg_end: float,                      # Segment effective end (source seconds)
+    text_len: int,                       # len(segment text) — the interpolation base
+    fa_words: Optional[List[Dict[str, Any]]],  # Transcript FA words [{"s","e","text"}] (source seconds); None = no cache
+) -> Optional[Tuple[float, float, str, List[Dict[str, Any]]]]:  # (start_s, end_s, snap, matched words); None = refused
+    """Derive a word range's TIME span from FA word timestamps (pure; fc42614d).
+
+    The lane is text-indexed — the driver selects WORDS, the span DERIVES:
+    FA words majority-inside the segment window are the candidates; equal
+    counts map by position, unequal counts align by normalized-token sequence
+    match (segment text may carry edits the layer-0 alignment never saw).
+    Matched endpoints -> snap "fa-word" with the matched word rows; no usable
+    match -> char-fraction interpolation over the segment span, snap
+    "estimated" (the plan_chunk_split seed regime — nudge-grade, refinable).
+    Refusals (None): empty tokens, an out-of-range selection, or a
+    zero/negative segment span."""
+    if not tokens or not (0 <= sel_a <= sel_b < len(tokens)):
+        return None
+    start, end = float(seg_start), float(seg_end)
+    if end <= start:
+        return None
+    win: List[Dict[str, Any]] = []
+    for w in (fa_words or []):
+        ws, we = float(w["s"]), float(w["e"])
+        if we <= ws:
+            continue
+        ov = min(we, end) - max(ws, start)
+        if ov > 0.5 * (we - ws):
+            win.append(w)
+    if win:
+        if len(win) == len(tokens):
+            hit = win[sel_a:sel_b + 1]
+            return float(hit[0]["s"]), float(hit[-1]["e"]), "fa-word", hit
+        sm = SequenceMatcher(a=[_norm_token(str(w.get("text") or "")) for w in win],
+                             b=[_norm_token(t) for _, _, t in tokens],
+                             autojunk=False)
+        tok_to_fa: Dict[int, int] = {}
+        for blk in sm.get_matching_blocks():
+            for k in range(blk.size):
+                tok_to_fa[blk.b + k] = blk.a + k
+        mapped = [tok_to_fa[i] for i in range(sel_a, sel_b + 1) if i in tok_to_fa]
+        if mapped:
+            hit = win[min(mapped):max(mapped) + 1]
+            return float(hit[0]["s"]), float(hit[-1]["e"]), "fa-word", hit
+    # No FA anchor for the selection: interpolate the char fractions (the
+    # split-seed regime) — still a committable sample, marked estimated.
+    n = max(1, int(text_len))
+    dur = end - start
+    s = start + dur * (tokens[sel_a][0] / n)
+    e = start + dur * (tokens[sel_b][1] / n)
+    return s, max(e, s + 0.01), "estimated", []
 
 
 def plan_gate(

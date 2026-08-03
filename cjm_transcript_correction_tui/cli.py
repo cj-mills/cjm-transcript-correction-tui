@@ -38,11 +38,17 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "default: the in-TUI spine picker (choice persists in the sidecar)")
     p.add_argument("--actor", default="human",
                    help="Actor recorded on corrections + review markers")
-    p.add_argument("--lane", choices=("walk", "assign", "propose"), default=None,
+    p.add_argument("--lane", choices=("walk", "assign", "propose", "annotate"), default=None,
                    help="Starting pass lane (multi-lane workbench, DEC cc55a7b5): "
-                        "walk = the correction vocabulary, assign = speaker assignment "
+                        "walk = the correction vocabulary, assign = speaker assignment, "
+                        "annotate = word-span sample creation (fc42614d) "
                         "(tab cycles in-TUI; default: the sidecar-persisted preference, "
                         "else walk)")
+    p.add_argument("--fa-cache-db", default=None,
+                   help="Forced-alignment cache db supplying word timestamps for the "
+                        "annotate lane's snap-to-word (default: the workspace's "
+                        "cjm-capability-qwen3-forced-aligner cache; missing = spans "
+                        "estimate from character fractions instead)")
     p.add_argument("--test", action="store_true",
                    help="Tag the minted session purpose=\"feature-test\" — feature-test "
                         "passes are structurally excludable from flywheel datasets "
@@ -89,6 +95,7 @@ def main() -> int:  # Console-script entry point
                         audio_device=device, resume=not args.no_resume,
                         shift_floor_s=args.shift_floor_ms / 1000.0,
                         nudge_step_ms=args.nudge_step_ms, lane=args.lane,
-                        purpose="feature-test" if args.test else None)
+                        purpose="feature-test" if args.test else None,
+                        fa_cache_db=args.fa_cache_db)
     app.run()
     return 0

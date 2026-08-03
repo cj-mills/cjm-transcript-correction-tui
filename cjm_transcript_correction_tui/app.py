@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.journal import sidecar_journal_path
+from cjm_substrate.core.workspace import resolve_workspace
 from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk, stretch
 from cjm_substrate_tui_kit.state import SidecarState
 from cjm_transcript_correction_core.graph import (commit_boundary_shift_correction,
@@ -15,12 +16,17 @@ from cjm_transcript_correction_core.graph import (commit_boundary_shift_correcti
                                                   commit_extraction_gate, commit_mark_correction,
                                                   commit_mark_dismissal, commit_prune_amendment,
                                                   commit_speaker_assign_correction,
-                                                  commit_speaker_entity, commit_text_correction,
-                                                  commit_time_nudge_correction, LEGACY_SKELETON,
+                                                  commit_speaker_entity,
+                                                  commit_speech_overlay_correction,
+                                                  commit_speech_overlay_removal,
+                                                  commit_text_correction,
+                                                  commit_time_nudge_correction,
+                                                  fa_words_for_transcript, LEGACY_SKELETON,
                                                   list_source_spines, list_speaker_entities,
                                                   session_purposes_by_source, start_session)
 from cjm_transcript_correction_core.models import (RECOMMENDED_INSERT_LABELS,
-                                                   RECOMMENDED_MARK_CLASSES)
+                                                   RECOMMENDED_MARK_CLASSES,
+                                                   RECOMMENDED_OVERLAY_LABELS)
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -28,7 +34,8 @@ from textual.widgets import Input, Static
 
 from .spine import (list_sources, load_source_slice, match_sources, open_stack, parse_entity_input,
                     parse_mark_input, plan_boundary_shift, plan_chunk_insert, plan_chunk_split,
-                    plan_gate, plan_time_nudge, resolve_mark_class_token, source_status, SpineView)
+                    plan_gate, plan_time_nudge, resolve_mark_class_token, segment_word_tokens,
+                    snap_word_span, source_status, SpineView)
 
 
 class CorrectionApp(App):
@@ -84,6 +91,22 @@ class CorrectionApp(App):
     PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
                                       "propose_audition", "toggle_tier2"})
 
+    # The annotate lane (check fc42614d, DEC 4e05a066): TEXT-INDEXED word-span
+    # sample creation — the word cursor walks the focused segment's words, v
+    # anchors a range, and a label commit derives the TIME span from FA word
+    # timestamps (snap-to-word; estimation fallback). A dedicated lane so
+    # sample drives never pollute the walk or propose vocabularies.
+    ANNOTATE_LANE_ACTIONS = frozenset({
+        "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+        "yank", "word_left", "word_right", "word_select", "annotate_quick",
+        "annotate_pick", "annotate_editor", "annotate_audition", "overlay_remove",
+        "next_overlay", "prev_overlay", "toggle_wordless_fold",
+        "cycle_lane", "cancel", "quit_app"})
+    ANNOTATE_ONLY_ACTIONS = frozenset({
+        "word_left", "word_right", "word_select", "annotate_quick", "annotate_pick",
+        "annotate_editor", "annotate_audition", "overlay_remove",
+        "next_overlay", "prev_overlay"})
+
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
     """
@@ -131,6 +154,22 @@ class CorrectionApp(App):
         Binding("N", "propose_prev", "prev proposal", show=False),
         Binding("R", "propose_audition", "audition proposal", show=False),
         Binding("t", "toggle_tier2", "tier-2 audition", show=False),
+        Binding("h", "word_left", "word ←", show=False),
+        Binding("l", "word_right", "word →", show=False),
+        Binding("left", "word_left", show=False),
+        Binding("right", "word_right", show=False),
+        Binding("v", "word_select", "select words", show=False),
+        Binding("space", "annotate_quick", show=False),
+        Binding("A", "annotate_editor", show=False),
+        Binding("R", "annotate_audition", show=False),
+        Binding("x", "overlay_remove", show=False),
+        Binding("n", "next_overlay", show=False),
+        Binding("N", "prev_overlay", show=False),
+        Binding("1", "annotate_pick(1)", show=False), Binding("2", "annotate_pick(2)", show=False),
+        Binding("3", "annotate_pick(3)", show=False), Binding("4", "annotate_pick(4)", show=False),
+        Binding("5", "annotate_pick(5)", show=False), Binding("6", "annotate_pick(6)", show=False),
+        Binding("7", "annotate_pick(7)", show=False), Binding("8", "annotate_pick(8)", show=False),
+        Binding("9", "annotate_pick(9)", show=False),
         Binding("m", "mark_quick", "mark"),
         Binding("b", "mark_boundary", "mark boundary"),
         Binding("M", "mark_editor", "mark+class"),
@@ -156,8 +195,9 @@ class CorrectionApp(App):
                  resume: bool = True,                     # Reopen at the source's last-focused segment
                  shift_floor_s: float = 0.0,              # Min seconds between held-key boundary shifts (0 = ungoverned; the commit guard is the real governor)
                  nudge_step_ms: Optional[float] = None,   # Boundary time-nudge step per ,/. press; None = sidecar-persisted preference, else 100 (the { } ladder adjusts live)
-                 lane: Optional[str] = None,              # Starting pass lane ("walk" | "assign"); None = sidecar-persisted preference, else walk (DEC 8a4df244)
-                 purpose: Optional[str] = None):          # None = genuine pass; "feature-test" tags the session excludable from flywheel datasets (--test, DEC c86714a4)
+                 lane: Optional[str] = None,              # Starting pass lane ("walk" | "assign" | "annotate"); None = sidecar-persisted preference, else walk (DEC 8a4df244)
+                 purpose: Optional[str] = None,           # None = genuine pass; "feature-test" tags the session excludable from flywheel datasets (--test, DEC c86714a4)
+                 fa_cache_db: Optional[str] = None):      # Forced-alignment cache db (word times, the annotate lane's snap source); None = workspace-resolved
         super().__init__()
         self._open_kwargs = dict(source=source, manifests_dir=manifests_dir,
                                  rendition=rendition, skeleton=skeleton)
@@ -187,6 +227,12 @@ class CorrectionApp(App):
         self._marks: Dict[int, str] = {}   # cursor position -> local decision echo
         self._mark_class = "suspect"       # last-used ⚑ class (m/b repeat it; sidecar-persisted)
         self._insert_label = "inhale"      # last-used ⊕ insert label (I pre-fills it; sidecar-persisted)
+        self._overlay_label = "hesitation-marker"  # last-used ◈ overlay label (space repeats it; sidecar-persisted)
+        self._word_cursor = 0              # annotate lane: word index on the focused segment
+        self._word_anchor: Optional[int] = None  # annotate lane: selection anchor (None = no range; v sets)
+        self._fa_cache_arg = fa_cache_db   # explicit --fa-cache-db (wins over the workspace default)
+        self._fa_cache_db: Optional[Path] = None  # resolved FA cache (None = estimation-only snapping)
+        self._fa_words_cache: Dict[str, Optional[List[Dict[str, Any]]]] = {}  # transcript id -> FA words (per-open memo)
         self._input_mode = "edit"          # what the hidden Input commits ("edit" | "mark" | "insert" | "assign" | "split" | "propose_split" | "gate")
         self._pending_proposal = None      # (anchor index, proposal dict) awaiting the propose-split editor hop
         self._ticker = None                # live playback-position timer (the r/R line-up readout)
@@ -295,7 +341,15 @@ class CorrectionApp(App):
         # Lane: explicit flag > sidecar preference > walk (DEC 8a4df244); the
         # speaker Entity registry loads once per open (source-spanning, people-scale).
         saved_lane = str(state.get("_lane") or "")
-        self.lane = self._lane_arg or (saved_lane if saved_lane in ("walk", "assign") else "walk")
+        self.lane = self._lane_arg or (saved_lane if saved_lane in ("walk", "assign", "annotate")
+                                       else "walk")
+        ol = str(state.get("_overlay_label") or "hesitation-marker")
+        self._overlay_label = ol if ol[:1].isalnum() else "hesitation-marker"
+        # The annotate lane's snap source: explicit flag > the workspace's FA
+        # capability cache; missing = the lane degrades to estimated spans.
+        self._fa_cache_db = self._resolve_fa_cache()
+        self._fa_words_cache = {}
+        self._word_cursor, self._word_anchor = 0, None
         self.fold_wordless = bool(state.get("_fold_wordless") or False)
         self._entities = await list_speaker_entities(self.view.queue, self.view.graph_id)
         self._active_entity = None
@@ -353,6 +407,8 @@ class CorrectionApp(App):
             g1.append(" ✂", style="red")
         if seg.id in view.marked_ids:
             g1.append(" ⚑", style="yellow")
+        if seg.id in view.overlay_ids:
+            g1.append(" ◈", style="cyan")
         g2 = Text()
         g2.append(f"{seg.start_time:.1f}–{seg.end_time:.1f}s"
                   if seg.start_time is not None else "(no audio)", style="dim")
@@ -394,6 +450,8 @@ class CorrectionApp(App):
                             style="dim magenta" if q == "??" else "dim cyan")
                 chip.append_text(body)
                 body = chip
+        elif self.lane == "annotate" and pos == self.cursor and seg.text:
+            body = self._annotate_body(seg)
         if abs(pos - self.cursor) > 1 and seg.text:
             body.stylize("dim")
         lane = body.wrap(self.console, lane_w)
@@ -472,7 +530,8 @@ class CorrectionApp(App):
         badge (d915d545 b — TEST PASS under --test, nothing when genuine) +
         position + lane-scoped counters + the ACTIVE LANE's keybar only."""
         view = self.view
-        badges = {"assign": "\\[ASSIGN]", "propose": "\\[PROPOSE]"}.get(self.lane, "\\[WALK]")
+        badges = {"assign": "\\[ASSIGN]", "propose": "\\[PROPOSE]",
+                  "annotate": "\\[ANNOTATE]"}.get(self.lane, "\\[WALK]")
         if self.purpose:
             badges += (" \\[TEST PASS]" if self.purpose == "feature-test"
                        else f" \\[{self.purpose.upper()}]")
@@ -507,6 +566,22 @@ class CorrectionApp(App):
                     f" · r chunk · ,./<> nudge"
                     f" · i/I manual · L relabel · x remove · e edit · j/k walk"
                     f" · g/G seam · tab lane · q quit")
+        if self.lane == "annotate":
+            seg = view.segments[self.cursor]
+            toks = segment_word_tokens(seg.text)
+            sel = self._selection_range(len(toks))
+            if toks and sel is not None:
+                a, b = sel
+                readout = " ".join(t for _, _, t in toks[a:b + 1])
+                readout = readout if len(readout) <= 30 else readout[:29] + "…"
+                sel_txt = f"  ·  sel “{readout}”"
+            else:
+                sel_txt = "  ·  (no words here)" if not toks else ""
+            return (f"{head}  ·  ◈ {view.overlay_count}{sel_txt}"
+                    f"  ·  label: {self._overlay_label}{tail}"
+                    f"  ·  h/l·←→ word · v range · space ◈commit · 1-9 class"
+                    f" · A class+ · R audition · x remove · n/N ◈ jump"
+                    f" · j/k walk · r replay · tab lane · q quit")
         edited = sum(1 for v in self._marks.values() if v == "corrected")
         return (f"{head}  ·  edited {edited}{tail}"
                 f"  ·  j/k·w/s walk · ←→/a/d shift · r replay · g/G seam · ,./<> nudge"
@@ -592,7 +667,10 @@ class CorrectionApp(App):
             return action in self.ASSIGN_LANE_ACTIONS
         if self.lane == "propose":
             return action in self.PROPOSE_LANE_ACTIONS
-        return action not in (self.ASSIGN_ONLY_ACTIONS | self.PROPOSE_ONLY_ACTIONS)
+        if self.lane == "annotate":
+            return action in self.ANNOTATE_LANE_ACTIONS
+        return action not in (self.ASSIGN_ONLY_ACTIONS | self.PROPOSE_ONLY_ACTIONS
+                              | self.ANNOTATE_ONLY_ACTIONS)
 
     async def action_open_source(self) -> None:
         if self.stage == "spine":
@@ -750,6 +828,7 @@ class CorrectionApp(App):
         if new == self.cursor:
             return
         self.cursor = new
+        self._word_cursor, self._word_anchor = 0, None  # word selection is per-segment
         now = time.monotonic()
         if now - self._state_saved > 1.0:   # bookmark survives crashes, not just quits
             save_tui_state(self._graph_db_path, self.view.source_id, new)
@@ -992,6 +1071,9 @@ class CorrectionApp(App):
         if self._input_mode == "gate":
             await self._submit_gate(event.value)
             return
+        if self._input_mode == "annotate":
+            await self._submit_annotate(event.value)
+            return
         seg = self.view.segments[self.cursor]
         new_text = event.value
         if new_text != seg.text:
@@ -1039,13 +1121,23 @@ class CorrectionApp(App):
         editor guard keeps a priority tab from hijacking an open edit."""
         if self.query_one("#editor", Input).display:
             return
-        # walk -> assign -> propose -> walk; the propose lane only enters the
-        # rotation when a proposal set loaded (no set = the walk stays manual).
-        order = ["walk", "assign"] + (["propose"] if self.view.proposals_meta else [])
+        # walk -> assign -> [propose ->] annotate -> walk; the propose lane only
+        # enters the rotation when a proposal set loaded (no set = the walk
+        # stays manual); the annotate lane is always available (fc42614d).
+        order = (["walk", "assign"] + (["propose"] if self.view.proposals_meta else [])
+                 + ["annotate"])
         self.lane = order[(order.index(self.lane) + 1) % len(order)] \
             if self.lane in order else "walk"
+        self._word_anchor = None
         save_tui_state(self._graph_db_path, self.view.source_id, None, lane=self.lane)
         self._render()
+        if self.lane == "annotate":
+            menu = self._overlay_label_menu()
+            self.query_one("#status", Static).update(
+                "annotate: h/l walk words · v range · space commits ◈"
+                + self._overlay_label + " · "
+                + " ".join(f"{i + 1}:{c}" for i, c in enumerate(menu[:6]))
+                + (" · …" if len(menu) > 6 else "") + " · A other")
         if self.lane == "assign":
             menu = self._assign_menu()
             if menu:
@@ -2197,12 +2289,275 @@ class CorrectionApp(App):
         wm_txt = f"{float(watermark):.1f}s" if watermark is not None else "none"
         status.update(f"⛭ gate asserted: {new_status} · annotated_through {wm_txt}")
 
+    def _resolve_fa_cache(self) -> Optional[Path]:
+        """Resolve the forced-alignment cache db (the annotate lane's word-time
+        source): explicit --fa-cache-db, else the workspace's FA capability
+        cache (the scan-mishomed default). None = estimation-only snapping."""
+        if self._fa_cache_arg:
+            p = Path(self._fa_cache_arg)
+            return p if p.is_file() else None
+        ws = resolve_workspace(explicit=None)
+        if ws is None:
+            return None
+        p = (ws.substrate_data_dir / "data" / "cjm-capability-qwen3-forced-aligner"
+             / "forced_alignments.db")
+        return p if p.is_file() else None
+
+    def _overlay_label_menu(self) -> List[str]:
+        """Selectable overlay labels: the recommended slate first, then labels
+        carried by this source's ACTIVE overlays (the mark-class menu pattern —
+        open vocabulary, slate is DATA)."""
+        return list(RECOMMENDED_OVERLAY_LABELS) + [
+            c for c in self.view.seen_overlay_labels
+            if c not in RECOMMENDED_OVERLAY_LABELS]
+
+    def _selection_range(self, n_tokens: int) -> Optional[Tuple[int, int]]:
+        """The selected token range (inclusive), clamped: the v-anchor..cursor
+        span when a range is anchored, else the word under the cursor. None =
+        no words."""
+        if n_tokens <= 0:
+            return None
+        c = max(0, min(n_tokens - 1, self._word_cursor))
+        if self._word_anchor is None:
+            return c, c
+        a = max(0, min(n_tokens - 1, self._word_anchor))
+        return (min(a, c), max(a, c))
+
+    def _annotate_body(self, seg) -> Text:
+        """The focused card's word-level paint in the annotate lane: the word
+        cursor underlined, the v-selection yellow, committed overlay spans
+        cyan (span offsets from each overlay's text-indexed anchor). Spans
+        only — no base style (7aca1117)."""
+        toks = segment_word_tokens(seg.text)
+        committed = []
+        for o in self.view.overlays_for(seg.id):
+            a = (o.get("payload") or {}).get("anchor") or {}
+            if a.get("char_start") is not None and a.get("char_end") is not None:
+                committed.append((int(a["char_start"]), int(a["char_end"])))
+        sel = self._selection_range(len(toks))
+        body = Text()
+        for i, (cs, ce, w) in enumerate(toks):
+            if i:
+                body.append(" ")
+            style = ""
+            if any(cs >= a and ce <= b for a, b in committed):
+                style = "cyan"
+            if sel is not None and sel[0] <= i <= sel[1]:
+                style = "bold yellow"
+            if i == self._word_cursor:
+                style = (style + " underline").strip()
+            body.append(w, style or None)
+        return body
+
+    async def _fa_words_for(self, seg) -> Optional[List[Dict[str, Any]]]:
+        """The segment's transcript FA words (source seconds), memoized per
+        Transcript node. None = no cache / join miss (estimation fallback)."""
+        tid = getattr(seg, "text_from", None)
+        if not tid or self._fa_cache_db is None:
+            return None
+        if tid not in self._fa_words_cache:
+            self._fa_words_cache[tid] = await fa_words_for_transcript(
+                self.view.queue, self.view.graph_id, tid, self._fa_cache_db)
+        return self._fa_words_cache[tid]
+
+    async def _snap_selection(self, seg) -> Optional[Dict[str, Any]]:
+        """Derive the current selection's FA-snapped record fields; None (with
+        a painted status) = refused."""
+        status = self.query_one("#status", Static)
+        toks = segment_word_tokens(seg.text)
+        sel = self._selection_range(len(toks))
+        if sel is None:
+            status.update("annotate: segment has no words (e-edit text lands in the walk lane)")
+            return None
+        if seg.start_time is None or seg.end_time is None:
+            status.update("annotate: segment has no audio times to snap against")
+            return None
+        a, b = sel
+        snapped = snap_word_span(toks, a, b, float(seg.start_time), float(seg.end_time),
+                                 len(seg.text), await self._fa_words_for(seg))
+        if snapped is None:
+            status.update("annotate: selection refused (word range invalid)")
+            return None
+        start_s, end_s, snap, words = snapped
+        char_start, char_end = toks[a][0], toks[b][1]
+        return {"char_start": char_start, "char_end": char_end,
+                "text": seg.text[char_start:char_end],
+                "start_time": start_s, "end_time": end_s,
+                "snap": snap, "words": words}
+
+    def _word_move(self, delta: int) -> None:
+        seg = self.view.segments[self.cursor]
+        n = len(segment_word_tokens(seg.text))
+        if n == 0:
+            self.query_one("#status", Static).update(
+                "annotate: no words on this segment — j/k to a text-bearing one")
+            return
+        self._word_cursor = max(0, min(n - 1, self._word_cursor + delta))
+        self._render()
+
+    def action_word_left(self) -> None:
+        self._word_move(-1)
+
+    def action_word_right(self) -> None:
+        self._word_move(1)
+
+    def action_word_select(self) -> None:
+        """v: anchor/clear the word-range selection (the vim visual gesture) —
+        anchored, h/l extends the range; v again collapses it."""
+        seg = self.view.segments[self.cursor]
+        n = len(segment_word_tokens(seg.text))
+        if n == 0:
+            self.query_one("#status", Static).update("annotate: no words to select")
+            return
+        self._word_anchor = None if self._word_anchor is not None \
+            else max(0, min(n - 1, self._word_cursor))
+        self._render()
+
+    async def action_annotate_audition(self) -> None:
+        """R (annotate lane): audition the selection's FA-snapped span — hear
+        exactly what a commit would record before recording it."""
+        seg = self.view.segments[self.cursor]
+        rec = await self._snap_selection(seg)
+        if rec is None:
+            return
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            rec["start_time"], rec["end_time"],
+            note=f" · ◈? “{rec['text'][:24]}” ({rec['snap']}) · space/1-9 commits"))
+
+    async def action_annotate_quick(self) -> None:
+        """space (annotate lane): commit the selection under the LAST-USED
+        label — the one-keystroke sample drive (the assign-space precedent)."""
+        await self._commit_overlay(self._overlay_label, None)
+
+    async def action_annotate_pick(self, n: int) -> None:
+        """1-9 (annotate lane): commit the selection under menu label #n."""
+        menu = self._overlay_label_menu()
+        if not (1 <= n <= len(menu)):
+            self.query_one("#status", Static).update(
+                f"annotate: no label #{n} — menu has {len(menu)} (A types a new one)")
+            return
+        await self._commit_overlay(menu[n - 1], None)
+
+    def action_annotate_editor(self) -> None:
+        """A (annotate lane): the open-vocabulary label editor —
+        `label-or-# [note...]` (the M/I picker grammar, shared resolver)."""
+        editor = self.query_one("#editor", Input)
+        self._input_mode = "annotate"
+        editor.value = f"{self._overlay_label} "
+        editor.display = True
+        editor.focus()
+        menu = self._overlay_label_menu()
+        self.query_one("#status", Static).update(
+            "annotate label: class-or-# [note] · "
+            + " ".join(f"{i + 1}:{c}" for i, c in enumerate(menu)))
+
+    async def _submit_annotate(self, raw: str) -> None:
+        """The A-editor submission: first token = the overlay label (digit
+        resolves against the menu), the rest is the note."""
+        self._close_editor()
+        raw, err = resolve_mark_class_token(raw, self._overlay_label_menu())
+        if err:
+            self._render()
+            self.query_one("#status", Static).update(f"annotate: {err}")
+            return
+        tokens = (raw or "").split()
+        if not tokens:
+            self._render()
+            return
+        label = tokens[0].strip('`"\'')
+        if not label or not label[:1].isalnum():
+            self._render()
+            self.query_one("#status", Static).update(
+                "annotate: label must start with a letter or digit")
+            return
+        await self._commit_overlay(label, " ".join(tokens[1:]) or None)
+
+    async def _commit_overlay(self, label: str, note: Optional[str]) -> None:
+        """Commit one speech overlay from the current selection: FA-snap the
+        word range, journal the sample, echo the ◈, and AUDITION the recorded
+        span (the toolkit's immediate-audible-verification regime)."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        rec = await self._snap_selection(seg)
+        if rec is None:
+            self._render()
+            return
+        anchor = {"kind": "span", "segment_id": seg.id,
+                  "char_start": rec["char_start"], "char_end": rec["char_end"],
+                  "text_snapshot": rec["text"]}
+        try:
+            overlay_id = await commit_speech_overlay_correction(
+                view.queue, view.graph_id, view.source_id, anchor, label,
+                rec["start_time"], rec["end_time"], rec["text"], self.session_id,
+                words=rec["words"], snap=rec["snap"], actor=self.actor, note=note,
+                journal_path=self._journal_path)
+        except ValueError as e:
+            self._render()
+            self.query_one("#status", Static).update(f"annotate refused: {e}")
+            return
+        view.add_overlay_local({"id": overlay_id, "correction_type": "annotation",
+                                "payload": {"operation": "speech_overlay",
+                                            "anchor": dict(anchor), "label": label,
+                                            "start_time": rec["start_time"],
+                                            "end_time": rec["end_time"],
+                                            "text": rec["text"], "snap": rec["snap"]}})
+        self._overlay_label = label
+        save_tui_state(self._graph_db_path, view.source_id, self.cursor,
+                       overlay_label=label)
+        self._word_anchor = None   # committed — the range hands back to the cursor
+        self._render()
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            rec["start_time"], rec["end_time"],
+            note=f" · ◈ {label} “{rec['text'][:24]}” ({rec['snap']})"))
+
+    async def action_overlay_remove(self) -> None:
+        """x (annotate lane): remove an overlay on the cursor segment — the one
+        covering the word cursor when there is one, else the newest
+        (reject-as-supersede, the mark-dismissal shape)."""
+        view = self.view
+        seg = view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        overlays = view.overlays_for(seg.id)
+        if not overlays:
+            status.update("annotate: no ◈ overlay on this segment")
+            return
+        toks = segment_word_tokens(seg.text)
+        target = None
+        if toks:
+            c = max(0, min(len(toks) - 1, self._word_cursor))
+            cs, ce = toks[c][0], toks[c][1]
+            for o in reversed(overlays):
+                a = (o.get("payload") or {}).get("anchor") or {}
+                if a.get("char_start") is not None and a.get("char_end") is not None \
+                        and int(a["char_start"]) <= cs and ce <= int(a["char_end"]):
+                    target = o
+                    break
+        target = target or overlays[-1]
+        await commit_speech_overlay_removal(
+            view.queue, view.graph_id, view.source_id, target["id"],
+            self.session_id, actor=self.actor, journal_path=self._journal_path)
+        view.remove_overlay_local(target["id"])
+        self._render()
+        p = target.get("payload") or {}
+        status.update(f"⊘ removed ◈ [{p.get('label')}] “{str(p.get('text') or '')[:24]}”")
+
+    def action_next_overlay(self) -> None:
+        self._jump_glyph(1, self.view.overlay_ids, "◈ annotated")
+
+    def action_prev_overlay(self) -> None:
+        self._jump_glyph(-1, self.view.overlay_ids, "◈ annotated")
+
     def action_cancel(self) -> None:
         editor = self.query_one("#editor", Input)
         if editor.display:
             self._accept_cluster = None  # an aborted a-gesture must not hijack the next assign
             self._pending_proposal = None  # an aborted propose-split hop likewise
             self._close_editor()
+            self._render()
+        elif self._word_anchor is not None:
+            self._word_anchor = None     # esc clears the word selection first
             self._render()
         else:
             self.player.stop()
@@ -2236,6 +2591,7 @@ def save_tui_state(
     speed: Optional[float] = None,  # Playback-rate preference (db-wide `_speed`; None = leave as-is)
     mark_class: Optional[str] = None,  # Last-used ⚑ class (db-wide `_mark_class`; None = leave as-is)
     insert_label: Optional[str] = None,  # Last-used ⊕ insert label (db-wide `_insert_label`; None = leave as-is)
+    overlay_label: Optional[str] = None,  # Last-used ◈ overlay label (db-wide `_overlay_label`; None = leave as-is)
     nudge_step_ms: Optional[float] = None,  # Nudge-step preference (db-wide `_nudge_step_ms`; None = leave as-is)
     lane: Optional[str] = None,      # Pass-lane preference (db-wide `_lane`; None = leave as-is)
     fold_wordless: Optional[bool] = None,  # z fold preference (db-wide `_fold_wordless`; None = leave as-is)
@@ -2267,6 +2623,8 @@ def save_tui_state(
         state["_mark_class"] = str(mark_class)
     if insert_label is not None:
         state["_insert_label"] = str(insert_label)
+    if overlay_label is not None:
+        state["_overlay_label"] = str(overlay_label)
     if nudge_step_ms is not None:
         state["_nudge_step_ms"] = float(nudge_step_ms)
     if lane is not None:
