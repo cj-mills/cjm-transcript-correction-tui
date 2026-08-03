@@ -2433,9 +2433,23 @@ class CorrectionApp(App):
         self._render()
 
     async def action_annotate_audition(self) -> None:
-        """R (annotate lane): audition the selection's FA-snapped span — hear
-        exactly what a commit would record before recording it."""
+        """R (annotate lane): audition what is UNDER the gesture. An anchored
+        v-selection plays its would-be-committed FA-snapped span (the
+        pre-commit preview); with no anchor, a COMMITTED overlay covering the
+        word cursor plays its CURRENT recorded span — nudges included (drive
+        ask 2026-08-03: the nudged tail must be re-hearable without nudging
+        again); otherwise the cursor word previews."""
         seg = self.view.segments[self.cursor]
+        if self._word_anchor is None:
+            ov = self._overlay_at_cursor(seg, covering_only=True)
+            if ov is not None:
+                p = ov.get("payload") or {}
+                self.player.stop()
+                self.run_worker(self._play_source_span(
+                    float(p["start_time"]), float(p["end_time"]),
+                    note=f" · ◈ {p.get('label')} “{str(p.get('text') or '')[:24]}”"
+                         f" ({p.get('snap')}) · ,./<> nudges · x removes"))
+                return
         rec = await self._snap_selection(seg)
         if rec is None:
             return
@@ -2531,9 +2545,12 @@ class CorrectionApp(App):
             rec["start_time"], rec["end_time"],
             note=f" · ◈ {label} “{rec['text'][:24]}” ({rec['snap']})"))
 
-    def _overlay_at_cursor(self, seg) -> Optional[Dict[str, Any]]:
+    def _overlay_at_cursor(self, seg,
+                           covering_only: bool = False) -> Optional[Dict[str, Any]]:
         """The gesture-target overlay on the cursor segment: the one covering
-        the word cursor when there is one, else the newest; None = no ◈."""
+        the word cursor when there is one, else the newest; None = no ◈.
+        `covering_only` drops the newest-fallback — the audition gesture must
+        not hijack a plain word preview from across the segment."""
         overlays = self.view.overlays_for(seg.id)
         if not overlays:
             return None
@@ -2546,7 +2563,7 @@ class CorrectionApp(App):
                 if a.get("char_start") is not None and a.get("char_end") is not None \
                         and int(a["char_start"]) <= cs and ce <= int(a["char_end"]):
                     return o
-        return overlays[-1]
+        return None if covering_only else overlays[-1]
 
     async def action_overlay_nudge(self, edge: str, sign: int) -> None:
         """,/. (span END) and </> (span START) in the annotate lane: nudge the

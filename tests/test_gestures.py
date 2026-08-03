@@ -747,3 +747,34 @@ def test_spineview_overlay_bookkeeping():
     assert view.seen_overlay_labels == ["hesitation-marker", "word-repeat"]
     view.remove_overlay_local("o1")
     assert view.overlay_ids == {"b"} and view.overlays_for("a") == []
+
+
+def test_overlay_at_cursor_targeting():
+    """Gesture targeting: covering overlay wins; the newest-fallback serves
+    nudge/remove but is DROPPED for audition (covering_only) so R on an
+    uncovered word stays a selection preview."""
+    from cjm_transcript_correction_core.models import SpineSegment
+    from cjm_transcript_correction_tui.app import CorrectionApp
+    from cjm_transcript_correction_tui.spine import SpineView
+    app = CorrectionApp()
+    view = SpineView.__new__(SpineView)
+    o_um = {"id": "o1", "correction_type": "annotation",
+            "payload": {"operation": "speech_overlay", "label": "hesitation-marker",
+                        "anchor": {"kind": "span", "segment_id": "a",
+                                   "char_start": 0, "char_end": 2,
+                                   "text_snapshot": "um"}}}
+    o_mean = {"id": "o2", "correction_type": "annotation",
+              "payload": {"operation": "speech_overlay", "label": "word-repeat",
+                          "anchor": {"kind": "span", "segment_id": "a",
+                                     "char_start": 5, "char_end": 9,
+                                     "text_snapshot": "mean"}}}
+    view._overlays = [o_um, o_mean]
+    view._recompute_overlay_ids()
+    app.view = view
+    seg = SpineSegment(id="a", index=0, text="um I mean")
+    app._word_cursor = 0                       # on "um" — o1 covers it
+    assert app._overlay_at_cursor(seg)["id"] == "o1"
+    assert app._overlay_at_cursor(seg, covering_only=True)["id"] == "o1"
+    app._word_cursor = 1                       # on "I" — nothing covers it
+    assert app._overlay_at_cursor(seg)["id"] == "o2"          # newest-fallback (nudge/remove)
+    assert app._overlay_at_cursor(seg, covering_only=True) is None  # audition previews instead
