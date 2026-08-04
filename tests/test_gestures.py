@@ -846,6 +846,8 @@ def test_overlay_pick_overrides_covering_test():
     app._overlay_pick = "gone"                 # superseded/removed pick self-clears
     assert app._overlay_at_cursor(seg)["id"] == "o2"
     assert app._overlay_pick is None
+    # the cycle enumerates in TIME order (o1 starts later despite listing first)
+    assert [o["id"] for o in app._segment_overlays_by_time(seg)] == ["o2", "o1"]
     # the cycle verb rides the annotate lane gate
     app.stage, app.lane = "correct", "annotate"
     assert app.check_action("overlay_cycle", ())

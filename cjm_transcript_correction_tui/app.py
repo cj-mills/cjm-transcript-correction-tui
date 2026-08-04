@@ -1161,7 +1161,7 @@ class CorrectionApp(App):
                 "annotate: h/l walk words · v range · space commits ◈"
                 + self._overlay_label + " · "
                 + " ".join(f"{i + 1}:{c}" for i, c in enumerate(menu[:6]))
-                + (" · …" if len(menu) > 6 else "") + " · A other")
+                + (" · …" if len(menu) > 6 else "") + " · A other · o picks ◈ stack")
         if self.lane == "assign":
             menu = self._assign_menu()
             if menu:
@@ -2465,11 +2465,31 @@ class CorrectionApp(App):
 
     async def action_annotate_quick(self) -> None:
         """space (annotate lane): commit the selection under the LAST-USED
-        label — the one-keystroke sample drive (the assign-space precedent)."""
+        label — the one-keystroke sample drive (the assign-space precedent).
+        Inert while an o-pick is live (finding 0686e7c0): commit's
+        auto-audition sounds identical to the cycle's, so a stray commit here
+        masks itself completely."""
+        if self._overlay_pick is not None:
+            self.query_one("#status", Static).update(
+                "annotate: ◈ pick live — o/O cycle · 1-9 jump · esc returns to commit keys")
+            return
         await self._commit_overlay(self._overlay_label, None)
 
     async def action_annotate_pick(self, n: int) -> None:
-        """1-9 (annotate lane): commit the selection under menu label #n."""
+        """1-9 (annotate lane): commit the selection under menu label #n — or,
+        while an o-pick is live, JUMP to pick #n in the time-ordered cycle (the
+        i/N status invites exactly this; before the guard each press silently
+        committed a stray overlay — finding 0686e7c0)."""
+        if self._overlay_pick is not None:
+            seg = self.view.segments[self.cursor]
+            overlays = self._segment_overlays_by_time(seg)
+            if 1 <= n <= len(overlays):
+                self._overlay_pick_set(overlays, n - 1)
+            else:
+                self.query_one("#status", Static).update(
+                    f"annotate: ◈ pick live — only {len(overlays)} on this segment"
+                    f" (o/O cycle · esc returns to commit keys)")
+            return
         menu = self._overlay_label_menu()
         if not (1 <= n <= len(menu)):
             self.query_one("#status", Static).update(
@@ -2479,7 +2499,12 @@ class CorrectionApp(App):
 
     def action_annotate_editor(self) -> None:
         """A (annotate lane): the open-vocabulary label editor —
-        `label-or-# [note...]` (the M/I picker grammar, shared resolver)."""
+        `label-or-# [note...]` (the M/I picker grammar, shared resolver).
+        Inert while an o-pick is live (the 0686e7c0 commit guard)."""
+        if self._overlay_pick is not None:
+            self.query_one("#status", Static).update(
+                "annotate: ◈ pick live — o/O cycle · 1-9 jump · esc returns to commit keys")
+            return
         editor = self.query_one("#editor", Input)
         self._input_mode = "annotate"
         editor.value = f"{self._overlay_label} "
@@ -2578,26 +2603,17 @@ class CorrectionApp(App):
                     return o
         return None if covering_only else overlays[-1]
 
-    def action_overlay_cycle(self, direction: int = 1) -> None:
-        """o/O (annotate lane): cycle an EXPLICIT ◈ target through the cursor
-        segment's overlays in TIME order, auditioning each — the id-level
-        selector (finding 13c5f6fb, drive ask 2026-08-04): stacked overlays
-        shadow each other under the covering test, and a drifted anchor covers
-        no word at all, leaving R/x/nudges unable to reach the overlay. The
-        pick overrides the covering test for every ◈ gesture until it clears
-        (esc, segment move, lane change, or a fresh commit)."""
-        seg = self.view.segments[self.cursor]
-        status = self.query_one("#status", Static)
-        overlays = sorted(
+    def _segment_overlays_by_time(self, seg) -> List[Dict[str, Any]]:
+        """The cursor segment's overlays in TIME order — the o-cycle's stable
+        enumeration (commit order would reshuffle under supersede chains)."""
+        return sorted(
             self.view.overlays_for(seg.id),
             key=lambda o: (float((o.get("payload") or {}).get("start_time") or 0.0),
                            float((o.get("payload") or {}).get("end_time") or 0.0)))
-        if not overlays:
-            status.update("annotate: no ◈ overlay on this segment to cycle")
-            return
-        ids = [o.get("id") for o in overlays]
-        i = ((ids.index(self._overlay_pick) + direction) % len(overlays)
-             if self._overlay_pick in ids else (0 if direction > 0 else len(overlays) - 1))
+
+    def _overlay_pick_set(self, overlays: List[Dict[str, Any]], i: int) -> None:
+        """Land pick #i: set the explicit target and audition it (the
+        immediate-audible-verification regime — cycling by ear is the point)."""
         pick = overlays[i]
         self._overlay_pick = pick.get("id")
         p = pick.get("payload") or {}
@@ -2606,7 +2622,29 @@ class CorrectionApp(App):
             float(p["start_time"]), float(p["end_time"]),
             note=f" · ◈ pick {i + 1}/{len(overlays)} {p.get('label')}"
                  f" “{str(p.get('text') or '')[:24]}” ({p.get('snap')})"
-                 f" · R/x/,./<> target it · esc clears"))
+                 f" · R/x/,./<> target it · 1-9 jump · esc clears"))
+
+    def action_overlay_cycle(self, direction: int = 1) -> None:
+        """o/O (annotate lane): cycle an EXPLICIT ◈ target through the cursor
+        segment's overlays in TIME order, auditioning each — the id-level
+        selector (finding 13c5f6fb, drive ask 2026-08-04): stacked overlays
+        shadow each other under the covering test, and a drifted anchor covers
+        no word at all, leaving R/x/nudges unable to reach the overlay. The
+        pick overrides the covering test for every ◈ gesture until it clears
+        (esc, segment move, lane change, or a fresh commit). While a pick is
+        live the COMMIT vocabulary is parked: 1-9 jump between picks and
+        space/A go inert (finding 0686e7c0 — digit presses in the pick flow
+        silently minted 75 stray overlays; commits resume on esc)."""
+        seg = self.view.segments[self.cursor]
+        overlays = self._segment_overlays_by_time(seg)
+        if not overlays:
+            self.query_one("#status", Static).update(
+                "annotate: no ◈ overlay on this segment to cycle")
+            return
+        ids = [o.get("id") for o in overlays]
+        i = ((ids.index(self._overlay_pick) + direction) % len(overlays)
+             if self._overlay_pick in ids else (0 if direction > 0 else len(overlays) - 1))
+        self._overlay_pick_set(overlays, i)
 
     async def action_overlay_nudge(self, edge: str, sign: int) -> None:
         """,/. (span END) and </> (span START) in the annotate lane: nudge the
