@@ -1032,11 +1032,18 @@ def snap_word_span(
     FA words majority-inside the segment window are the candidates; equal
     counts map by position, unequal counts align by normalized-token sequence
     match (segment text may carry edits the layer-0 alignment never saw).
-    Matched endpoints -> snap "fa-word" with the matched word rows; no usable
-    match -> char-fraction interpolation over the segment span, snap
-    "estimated" (the plan_chunk_split seed regime — nudge-grade, refinable).
-    Refusals (None): empty tokens, an out-of-range selection, or a
-    zero/negative segment span."""
+    Snap is a TRUST STAMP, three-tier (finding 162935f5): BOTH endpoint
+    tokens matched -> "fa-word" (interior gaps allowed — only the outer
+    edges matter); some tokens matched but an endpoint missing (fast-speech
+    smear drops short words like the 'know' in 'you know') -> "fa-partial" —
+    the matched edge holds, the missing edge extrapolates at the matched
+    words' local speech rate (never claiming fa-word coverage the words
+    don't have; extrapolation only GROWS the span, clamped to the segment
+    window, so it can never invert order); no usable match -> char-fraction
+    interpolation over the segment span, snap "estimated" (the
+    plan_chunk_split seed regime — nudge-grade, refinable). Refusals (None):
+    empty tokens, an out-of-range selection, or a zero/negative segment
+    span."""
     if not tokens or not (0 <= sel_a <= sel_b < len(tokens)):
         return None
     start, end = float(seg_start), float(seg_end)
@@ -1064,7 +1071,18 @@ def snap_word_span(
         mapped = [tok_to_fa[i] for i in range(sel_a, sel_b + 1) if i in tok_to_fa]
         if mapped:
             hit = win[min(mapped):max(mapped) + 1]
-            return float(hit[0]["s"]), float(hit[-1]["e"]), "fa-word", hit
+            fa_lo, fa_hi = float(hit[0]["s"]), float(hit[-1]["e"])
+            if sel_a in tok_to_fa and sel_b in tok_to_fa:
+                return fa_lo, fa_hi, "fa-word", hit
+            m_toks = [i for i in range(sel_a, sel_b + 1) if i in tok_to_fa]
+            first_m, last_m = min(m_toks), max(m_toks)
+            extent = max(1, tokens[last_m][1] - tokens[first_m][0])
+            rate = (fa_hi - fa_lo) / extent
+            s = fa_lo if sel_a in tok_to_fa else max(
+                start, fa_lo - rate * (tokens[first_m][0] - tokens[sel_a][0]))
+            e = fa_hi if sel_b in tok_to_fa else min(
+                end, fa_hi + rate * (tokens[sel_b][1] - tokens[last_m][1]))
+            return s, max(e, s + 0.01), "fa-partial", hit
     # No FA anchor for the selection: interpolate the char fractions (the
     # split-seed regime) — still a committable sample, marked estimated.
     n = max(1, int(text_len))

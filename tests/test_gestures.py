@@ -671,10 +671,15 @@ def test_snap_word_span_direct_fuzzy_and_estimated():
     # direct positional map (counts equal; punctuation/case-insensitive)
     s, e, snap, hit = snap_word_span(toks, 0, 1, 10.0, 11.0, len("um I mean"), fa)
     assert (s, e, snap) == (10.0, 10.5, "fa-word") and len(hit) == 2
-    # fuzzy: the effective text carries an extra edited word FA never saw
+    # fuzzy: the effective text carries an extra edited word FA never saw —
+    # the unmatched ENDPOINT downgrades the stamp (finding 162935f5): the
+    # matched edge holds, the missing edge extrapolates at local rate
     toks2 = segment_word_tokens("um I really mean")
     s, e, snap, hit = snap_word_span(toks2, 2, 3, 10.0, 11.0, len("um I really mean"), fa)
-    assert snap == "fa-word" and (s, e) == (10.6, 11.0)   # 'mean' matched, range clips to it
+    assert snap == "fa-partial" and e == 11.0 and 10.0 <= s < 10.6
+    # a fully-matched sub-range still earns fa-word (interior gaps only)
+    s, e, snap, hit = snap_word_span(toks2, 3, 3, 10.0, 11.0, len("um I really mean"), fa)
+    assert snap == "fa-word" and (s, e) == (10.6, 11.0)
     # no cache -> char-fraction estimation (the split-seed regime)
     s, e, snap, hit = snap_word_span(toks, 0, 0, 10.0, 11.0, len("um I mean"), None)
     assert snap == "estimated" and hit == [] and 10.0 <= s < e <= 11.0
@@ -685,6 +690,31 @@ def test_snap_word_span_direct_fuzzy_and_estimated():
     assert snap_word_span([], 0, 0, 10.0, 11.0, 9, fa) is None
     assert snap_word_span(toks, 2, 1, 10.0, 11.0, 9, fa) is None
     assert snap_word_span(toks, 0, 0, 11.0, 11.0, 9, fa) is None
+
+
+def test_snap_word_span_endpoint_partial_live_case():
+    """Finding 162935f5 regression, on the live CW #57 shape: fast 'you know'
+    where FA dropped 'know' — the old code committed the narrowed one-word
+    span stamped fa-word; now the tail extrapolates and the stamp says
+    fa-partial (order can never invert: extrapolation only grows the span)."""
+    from cjm_transcript_correction_tui.spine import segment_word_tokens, snap_word_span
+    toks = segment_word_tokens("you know, you could debate")
+    fa = [{"s": 185.92, "e": 186.08, "text": "you"},
+          {"s": 186.25, "e": 186.32, "text": "you"},
+          {"s": 186.32, "e": 186.50, "text": "could"},
+          {"s": 186.50, "e": 186.80, "text": "debate"}]
+    s, e, snap, hit = snap_word_span(toks, 0, 1, 185.9, 186.8, len("you know, you could debate"), fa)
+    assert snap == "fa-partial" and [w["text"] for w in hit] == ["you"]
+    assert s == 185.92          # matched head edge holds
+    assert e > 186.08           # tail GREW past the smeared FA edge (no narrowing)
+    assert e <= 186.8           # clamped to the segment window
+    # leading-edge dual: selection whose HEAD is the unmatched token
+    toks2 = segment_word_tokens("know, you could")
+    fa2 = [{"s": 186.25, "e": 186.32, "text": "you"},
+          {"s": 186.32, "e": 186.50, "text": "could"}]
+    s, e, snap, hit = snap_word_span(toks2, 0, 2, 186.1, 186.6, len("know, you could"), fa2)
+    assert snap == "fa-partial" and e == 186.50
+    assert 186.1 <= s < 186.25  # head grew backward, floored at the segment start
 
 
 def test_annotate_lane_gate_and_selection_range():
