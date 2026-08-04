@@ -810,6 +810,49 @@ def test_overlay_at_cursor_targeting():
     assert app._overlay_at_cursor(seg, covering_only=True) is None  # audition previews instead
 
 
+def test_overlay_pick_overrides_covering_test():
+    """The o-cycled ◈ pick (finding 13c5f6fb): an explicit id-level target wins
+    over the covering test in BOTH modes — a drifted-anchor or shadowed
+    overlay stays reachable for R/x/nudges — and a stale pick (superseded or
+    removed id) clears itself and falls back to covering."""
+    from cjm_transcript_correction_core.models import SpineSegment
+    from cjm_transcript_correction_tui.app import CorrectionApp
+    from cjm_transcript_correction_tui.spine import SpineView
+    app = CorrectionApp()
+    view = SpineView.__new__(SpineView)
+    # o1's anchor drifted onto a word FRAGMENT (covers no full token); o2, the
+    # newer stacked overlay, covers "um" — the covering test can never pick o1.
+    o_drift = {"id": "o1", "correction_type": "annotation",
+               "payload": {"operation": "speech_overlay", "label": "hesitation-marker",
+                           "start_time": 1.0, "end_time": 1.2,
+                           "anchor": {"kind": "span", "segment_id": "a",
+                                      "char_start": 3, "char_end": 4,
+                                      "text_snapshot": "I"}}}
+    o_cover = {"id": "o2", "correction_type": "annotation",
+               "payload": {"operation": "speech_overlay", "label": "word-repeat",
+                           "start_time": 0.0, "end_time": 0.4,
+                           "anchor": {"kind": "span", "segment_id": "a",
+                                      "char_start": 0, "char_end": 2,
+                                      "text_snapshot": "um"}}}
+    view._overlays = [o_drift, o_cover]
+    view._recompute_overlay_ids()
+    app.view = view
+    seg = SpineSegment(id="a", index=0, text="um I mean")
+    app._word_cursor = 0                       # on "um" — o2 covers, o1 unreachable
+    assert app._overlay_at_cursor(seg, covering_only=True)["id"] == "o2"
+    app._overlay_pick = "o1"                   # the explicit pick reaches it anyway
+    assert app._overlay_at_cursor(seg)["id"] == "o1"
+    assert app._overlay_at_cursor(seg, covering_only=True)["id"] == "o1"
+    app._overlay_pick = "gone"                 # superseded/removed pick self-clears
+    assert app._overlay_at_cursor(seg)["id"] == "o2"
+    assert app._overlay_pick is None
+    # the cycle verb rides the annotate lane gate
+    app.stage, app.lane = "correct", "annotate"
+    assert app.check_action("overlay_cycle", ())
+    app.lane = "walk"
+    assert not app.check_action("overlay_cycle", ())
+
+
 def test_neighbor_word_bound_overshoot_guard_data():
     """The overlay-nudge advisory's data (pure): the facing FA boundary of the
     span's in-segment neighbor; None off the segment edge or when the

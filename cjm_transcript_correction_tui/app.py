@@ -100,13 +100,13 @@ class CorrectionApp(App):
         "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
         "yank", "word_left", "word_right", "word_select", "annotate_quick",
         "annotate_pick", "annotate_editor", "annotate_audition", "overlay_remove",
-        "overlay_nudge", "nudge_step_down", "nudge_step_up",
+        "overlay_nudge", "overlay_cycle", "nudge_step_down", "nudge_step_up",
         "next_overlay", "prev_overlay", "toggle_wordless_fold",
         "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
     ANNOTATE_ONLY_ACTIONS = frozenset({
         "word_left", "word_right", "word_select", "annotate_quick", "annotate_pick",
         "annotate_editor", "annotate_audition", "overlay_remove", "overlay_nudge",
-        "next_overlay", "prev_overlay"})
+        "overlay_cycle", "next_overlay", "prev_overlay"})
 
     CSS = """
     #cards { height: 1fr; overflow: hidden hidden; }
@@ -169,6 +169,8 @@ class CorrectionApp(App):
         Binding("A", "annotate_editor", show=False),
         Binding("R", "annotate_audition", show=False),
         Binding("x", "overlay_remove", show=False),
+        Binding("o", "overlay_cycle(1)", show=False),
+        Binding("O", "overlay_cycle(-1)", show=False),
         Binding("n", "next_overlay", show=False),
         Binding("N", "prev_overlay", show=False),
         Binding("1", "annotate_pick(1)", show=False), Binding("2", "annotate_pick(2)", show=False),
@@ -235,6 +237,7 @@ class CorrectionApp(App):
         self._insert_label = "inhale"      # last-used ⊕ insert label (I pre-fills it; sidecar-persisted)
         self._overlay_label = "hesitation-marker"  # last-used ◈ overlay label (space repeats it; sidecar-persisted)
         self._word_cursor = 0              # annotate lane: word index on the focused segment
+        self._overlay_pick: Optional[str] = None  # annotate lane: o-cycled explicit ◈ target (id-level)
         self._word_anchor: Optional[int] = None  # annotate lane: selection anchor (None = no range; v sets)
         self._fa_cache_arg = fa_cache_db   # explicit --fa-cache-db (wins over the workspace default)
         self._fa_cache_db: Optional[Path] = None  # resolved FA cache (None = estimation-only snapping)
@@ -835,6 +838,7 @@ class CorrectionApp(App):
             return
         self.cursor = new
         self._word_cursor, self._word_anchor = 0, None  # word selection is per-segment
+        self._overlay_pick = None                       # so is the o-cycled ◈ pick
         now = time.monotonic()
         if now - self._state_saved > 1.0:   # bookmark survives crashes, not just quits
             save_tui_state(self._graph_db_path, self.view.source_id, new)
@@ -1148,6 +1152,7 @@ class CorrectionApp(App):
         self.lane = order[(order.index(self.lane) + delta) % len(order)] \
             if self.lane in order else "walk"
         self._word_anchor = None
+        self._overlay_pick = None
         save_tui_state(self._graph_db_path, self.view.source_id, None, lane=self.lane)
         self._render()
         if self.lane == "annotate":
@@ -2539,6 +2544,7 @@ class CorrectionApp(App):
         save_tui_state(self._graph_db_path, view.source_id, self.cursor,
                        overlay_label=label)
         self._word_anchor = None   # committed — the range hands back to the cursor
+        self._overlay_pick = None  # a fresh commit retires any explicit pick
         self._render()
         self.player.stop()
         self.run_worker(self._play_source_span(
@@ -2547,13 +2553,20 @@ class CorrectionApp(App):
 
     def _overlay_at_cursor(self, seg,
                            covering_only: bool = False) -> Optional[Dict[str, Any]]:
-        """The gesture-target overlay on the cursor segment: the one covering
-        the word cursor when there is one, else the newest; None = no ◈.
-        `covering_only` drops the newest-fallback — the audition gesture must
-        not hijack a plain word preview from across the segment."""
+        """The gesture-target overlay on the cursor segment: an o-cycled PICK
+        when one is live (id-level — finding 13c5f6fb: the covering test alone
+        cannot reach a drifted-anchor or shadowed overlay), else the one
+        covering the word cursor, else the newest; None = no ◈. `covering_only`
+        drops the newest-fallback — the audition gesture must not hijack a
+        plain word preview from across the segment."""
         overlays = self.view.overlays_for(seg.id)
         if not overlays:
             return None
+        if self._overlay_pick is not None:
+            for o in overlays:
+                if o.get("id") == self._overlay_pick:
+                    return o
+            self._overlay_pick = None  # picked overlay superseded/removed — fall through
         toks = segment_word_tokens(seg.text)
         if toks:
             c = max(0, min(len(toks) - 1, self._word_cursor))
@@ -2564,6 +2577,36 @@ class CorrectionApp(App):
                         and int(a["char_start"]) <= cs and ce <= int(a["char_end"]):
                     return o
         return None if covering_only else overlays[-1]
+
+    def action_overlay_cycle(self, direction: int = 1) -> None:
+        """o/O (annotate lane): cycle an EXPLICIT ◈ target through the cursor
+        segment's overlays in TIME order, auditioning each — the id-level
+        selector (finding 13c5f6fb, drive ask 2026-08-04): stacked overlays
+        shadow each other under the covering test, and a drifted anchor covers
+        no word at all, leaving R/x/nudges unable to reach the overlay. The
+        pick overrides the covering test for every ◈ gesture until it clears
+        (esc, segment move, lane change, or a fresh commit)."""
+        seg = self.view.segments[self.cursor]
+        status = self.query_one("#status", Static)
+        overlays = sorted(
+            self.view.overlays_for(seg.id),
+            key=lambda o: (float((o.get("payload") or {}).get("start_time") or 0.0),
+                           float((o.get("payload") or {}).get("end_time") or 0.0)))
+        if not overlays:
+            status.update("annotate: no ◈ overlay on this segment to cycle")
+            return
+        ids = [o.get("id") for o in overlays]
+        i = ((ids.index(self._overlay_pick) + direction) % len(overlays)
+             if self._overlay_pick in ids else (0 if direction > 0 else len(overlays) - 1))
+        pick = overlays[i]
+        self._overlay_pick = pick.get("id")
+        p = pick.get("payload") or {}
+        self.player.stop()
+        self.run_worker(self._play_source_span(
+            float(p["start_time"]), float(p["end_time"]),
+            note=f" · ◈ pick {i + 1}/{len(overlays)} {p.get('label')}"
+                 f" “{str(p.get('text') or '')[:24]}” ({p.get('snap')})"
+                 f" · R/x/,./<> target it · esc clears"))
 
     async def action_overlay_nudge(self, edge: str, sign: int) -> None:
         """,/. (span END) and </> (span START) in the annotate lane: nudge the
@@ -2625,6 +2668,8 @@ class CorrectionApp(App):
                                 "payload": {**p, "anchor": anchor,
                                             "start_time": new_start,
                                             "end_time": new_end, "snap": "nudged"}})
+        if self._overlay_pick == target["id"]:   # the pick follows the supersede chain
+            self._overlay_pick = overlay_id
         self._render()
         self.player.stop()
         self.run_worker(self._play_source_span(
@@ -2646,6 +2691,8 @@ class CorrectionApp(App):
             view.queue, view.graph_id, view.source_id, target["id"],
             self.session_id, actor=self.actor, journal_path=self._journal_path)
         view.remove_overlay_local(target["id"])
+        if self._overlay_pick == target["id"]:
+            self._overlay_pick = None
         self._render()
         p = target.get("payload") or {}
         status.update(f"⊘ removed ◈ [{p.get('label')}] “{str(p.get('text') or '')[:24]}”")
@@ -2665,6 +2712,9 @@ class CorrectionApp(App):
             self._render()
         elif self._word_anchor is not None:
             self._word_anchor = None     # esc clears the word selection first
+            self._render()
+        elif self._overlay_pick is not None:
+            self._overlay_pick = None    # then the o-cycled ◈ pick
             self._render()
         else:
             self.player.stop()
