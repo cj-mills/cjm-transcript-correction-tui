@@ -61,7 +61,7 @@ class CorrectionApp(App):
     SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)  # the [ ] playback-rate ladder (0.5/3.0 = the comprehension bounds, drive-round-7 verdict)
     WORDLESS_INSERT_LABELS = {"inhale", "empty", "throat-clear", "background-noise",
                               "click", "background-music", "background-voices", "echo",
-                              "wheeze"}  # insert classes never meant to carry words (shift-across hop + z fold candidates; DEC a5754fa4; 'empty' = the sole silence term ('dead-air' retired, 8c0aa0bf); background-noise/click adopted 2026-07-30 (phenomenon-true FP labels — bench derives RELABELED, training gets explicit hard negatives); empty-text guard backstops all
+                              "wheeze", "chuckle"}  # insert classes never meant to carry words (shift-across hop + z fold candidates; DEC a5754fa4; 'empty' = the sole silence term ('dead-air' retired, 8c0aa0bf); background-noise/click adopted 2026-07-30 (phenomenon-true FP labels — bench derives RELABELED, training gets explicit hard negatives); empty-text guard backstops all
 
     NUDGE_STEPS_MS = (1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)  # the { } nudge-step ladder (first drive: 100ms fits some cuts, others need 20/10/5; 1ms added 2026-07-27 — a Chris Wright boundary at ~358.5s outgrew 5ms — granularity is per-BOUNDARY)
 
